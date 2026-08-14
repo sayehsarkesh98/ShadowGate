@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+wrangler.toml
+_worker (1).js
+*.pyc
+.env

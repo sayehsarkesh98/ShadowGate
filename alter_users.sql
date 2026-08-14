@@ -1,0 +1,15 @@
+ALTER TABLE users ADD COLUMN used_bandwidth_bytes INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN bandwidth_reset_period TEXT DEFAULT 'monthly';
+ALTER TABLE users ADD COLUMN last_bandwidth_reset TEXT;
+ALTER TABLE users ADD COLUMN start_date TEXT DEFAULT (datetime('now'));
+ALTER TABLE users ADD COLUMN is_frozen INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN frozen_at TEXT;
+ALTER TABLE users ADD COLUMN plan_id INTEGER;
+ALTER TABLE users ADD COLUMN created_by INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN protocols TEXT DEFAULT '{"vless": true, "trojan": true}';
+ALTER TABLE users ADD COLUMN tags TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN telegram_id TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN telegram_username TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN is_online INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN last_online_at TEXT;
+ALTER TABLE users ADD COLUMN last_ip TEXT;
