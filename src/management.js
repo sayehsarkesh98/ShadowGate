@@ -1,5 +1,5 @@
 // ============================================
-// EDGE TUNNEL MANAGEMENT SYSTEM v2
+// SHADOWGATE MANAGEMENT SYSTEM
 // Professional VPN Management Panel
 // ============================================
 
@@ -1088,7 +1088,7 @@ export async function mgmtHandleRequest(request, env, ctx) {
     const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
     const isWebSocket = upgradeHeader === 'websocket' || !!request.headers.get('Sec-WebSocket-Key');
 
-    // Let WebSocket and gRPC connections pass through to Edge Tunnel
+    // Let WebSocket and gRPC connections pass through to ShadowGate
     if (isWebSocket) return null;
     if (method === 'POST') {
         const contentType = (request.headers.get('content-type') || '').toLowerCase();
@@ -1282,7 +1282,7 @@ function mgmtAdminHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Edge Manager - پنل مدیریت</title>
+    <title>ShadowGate - پنل مدیریت</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         :root {
@@ -1418,7 +1418,7 @@ function mgmtAdminHTML() {
 <body>
     <div id="loginPage" class="login-box">
         <div class="login-form">
-            <h1>🔐 Edge Manager</h1>
+            <h1>🔐 ShadowGate</h1>
             <input type="text" id="loginUsername" placeholder="نام کاربری" value="admin">
             <input type="password" id="loginPassword" placeholder="رمز عبور" onkeypress="if(event.key==='Enter')doLogin()">
             <button onclick="doLogin()">ورود</button>
@@ -1427,7 +1427,7 @@ function mgmtAdminHTML() {
 
     <div id="dashboard" style="display:none">
         <div class="header">
-            <h1>⚡ Edge Manager</h1>
+            <h1>⚡ ShadowGate</h1>
             <div class="header-actions">
                 <button class="btn btn-outline btn-sm" onclick="loadStats();loadUsers();">🔄 بروزرسانی</button>
                 <button class="btn btn-danger btn-sm" onclick="doLogout()">خروج</button>
@@ -1589,7 +1589,7 @@ function mgmtAdminHTML() {
                 <div style="background:var(--bg-secondary); padding:1.5rem; border-radius:0.75rem; border:1px solid var(--border); max-width:600px;">
                     <div class="form-group">
                         <label>نام سیستم</label>
-                        <input type="text" id="settingSystemName" value="Edge Manager">
+                        <input type="text" id="settingSystemName" value="ShadowGate">
                     </div>
                     <div class="form-group">
                         <label>آستانه هشدار حجم (%)</label>
@@ -2147,7 +2147,7 @@ function mgmtAdminHTML() {
                 const r = await fetch('/api/admin/settings', {headers: {'Authorization': 'Bearer ' + token}});
                 const d = await r.json();
                 if (d.settings) {
-                    document.getElementById('settingSystemName').value = d.settings.system_name || 'Edge Manager';
+                    document.getElementById('settingSystemName').value = d.settings.system_name || 'ShadowGate';
                     document.getElementById('settingTrafficAlert').value = d.settings.traffic_alert_threshold || 80;
                     document.getElementById('settingExpiryWarning').value = d.settings.expiry_warning_days || 7;
                     document.getElementById('settingTelegramToken').value = d.settings.telegram_bot_token || '';
@@ -2252,7 +2252,7 @@ function mgmtStatusHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>بررسی وضعیت - Edge Manager</title>
+    <title>بررسی وضعیت - ShadowGate</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: flex; justify-content: center; align-items: center; }

@@ -1,10 +1,10 @@
 // ============================================
 // INTEGRATION GUIDE
 // How to integrate the new management system
-// into the existing edge-tunnel-managed.js
+// into the existing ShadowGate-managed.js
 // ============================================
 
-// STEP 1: Add imports at the top of edge-tunnel-managed.js
+// STEP 1: Add imports at the top of ShadowGate-managed.js
 // (after the existing constants, around line 18)
 /*
 import { mgmtHandleRequest, mgmtValidateUUID, mgmtTrackBandwidth, 获取活跃UUID列表, clearUUIDCache } from './management.js';
@@ -12,7 +12,7 @@ import { handleCron } from './cron.js';
 */
 
 // STEP 2: Replace the old management functions with imports
-// Remove these functions from edge-tunnel-managed.js:
+// Remove these functions from ShadowGate-managed.js:
 // - mgmtValidateUUID (line ~29)
 // - mgmtTrackBandwidth (line ~62)
 // - mgmtGenerateUUID (line ~93)
@@ -71,7 +71,7 @@ crons = ["0 0 * * *"]  # Run daily at midnight
 // ============================================
 // The following sections must remain EXACTLY as they are:
 //
-// 1. The main Edge Tunnel proxy logic (处理WS请求, 处理gRPC请求, etc.)
+// 1. The main ShadowGate proxy logic (处理WS请求, 处理gRPC请求, etc.)
 // 2. The VLESS/Trojan/Shadowsocks parsing functions
 // 3. The TLS/SSL handling code
 // 4. The subscription (/sub) endpoint handling
@@ -79,5 +79,5 @@ crons = ["0 0 * * *"]  # Run daily at midnight
 // 6. The gRPC/XHTTP handling
 // 7. All the Chinese-named utility functions
 //
-// These are the core proxy functions that make Edge Tunnel work.
+// These are the core proxy functions that make ShadowGate work.
 // Only the management layer (mgmt* functions) should be replaced.

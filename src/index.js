@@ -1,5 +1,5 @@
 // ============================================
-// Edge Tunnel Manager - Cloudflare Worker
+// ShadowGate - Cloudflare Worker
 // Professional UUID Management + Bandwidth Control
 // Version: 1.0.0
 // ============================================
@@ -267,7 +267,7 @@ async function handleUserRoutes(request, env, ctx, path, method, corsHeaders) {
         return getUserStatus(uuid, env, corsHeaders);
     }
 
-    // Track bandwidth (called by Edge Tunnel)
+    // Track bandwidth (called by ShadowGate)
     if (route === 'track' && method === 'POST') {
         return trackBandwidth(request, env, corsHeaders);
     }
@@ -797,7 +797,7 @@ function getAdminPanel(env, corsHeaders) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Edge Manager - پنل مدیریت</title>
+    <title>ShadowGate - پنل مدیریت</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
@@ -877,7 +877,7 @@ function getAdminPanel(env, corsHeaders) {
     <!-- Login Page -->
     <div id="loginPage" class="login-container">
         <div class="login-box">
-            <h1>🔐 Edge Manager</h1>
+            <h1>🔐 ShadowGate</h1>
             <input type="password" id="loginPassword" placeholder="رمز عبور" onkeypress="if(event.key==='Enter')login()">
             <button onclick="login()">ورود</button>
         </div>
@@ -886,7 +886,7 @@ function getAdminPanel(env, corsHeaders) {
     <!-- Dashboard -->
     <div id="dashboardPage" class="dashboard">
         <div class="header">
-            <h1>⚡ Edge Manager</h1>
+            <h1>⚡ ShadowGate</h1>
             <button onclick="logout()">خروج</button>
         </div>
 
@@ -984,7 +984,7 @@ function getAdminPanel(env, corsHeaders) {
                 <h3 style="margin-bottom: 1rem; color: #60a5fa;">⚙️ تنظیمات سیستم</h3>
                 <div class="form-group">
                     <label>نام سیستم</label>
-                    <input type="text" id="settingSystemName" placeholder="Edge Manager">
+                    <input type="text" id="settingSystemName" placeholder="ShadowGate">
                 </div>
                 <div class="form-group">
                     <label>حداکثر پهنای باند پیش‌فرض (MB, 0 = نامحدود)</label>
@@ -1453,7 +1453,7 @@ function getAdminPanel(env, corsHeaders) {
                 });
                 const data = await res.json();
                 const s = data.settings || {};
-                document.getElementById('settingSystemName').value = s.system_name || 'Edge Manager';
+                document.getElementById('settingSystemName').value = s.system_name || 'ShadowGate';
                 document.getElementById('settingMaxBandwidth').value = s.max_bandwidth_default || 0;
                 document.getElementById('settingMaxConnections').value = s.max_connections_default || 1;
                 document.getElementById('settingExpiryDays').value = s.default_expiry_days || 30;

@@ -4,7 +4,7 @@ let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org',
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
-const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
+const 上行合包目标字节 = 128 * 1024, 上行队列最大字节 = 8 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
@@ -18,13 +18,13 @@ const 特征码字典 = [
 
 
 // ============================================
-// EDGE TUNNEL MANAGEMENT SYSTEM v2
+// SHADOWGATE MANAGEMENT SYSTEM
 // Professional VPN Management Panel
 // ============================================
 
 // --- Inline management functions (from management.js) ---
 // ============================================
-// EDGE TUNNEL MANAGEMENT SYSTEM v2
+// SHADOWGATE MANAGEMENT SYSTEM
 // Professional VPN Management Panel
 // ============================================
 
@@ -175,7 +175,7 @@ async function mgmtValidateUUID(env, uuid, clientIP, protocol) {
 			if (!existing) {
 				// New subnet — check if we have room
 				const deviceCount = await env.DB.prepare(
-					'SELECT COUNT(DISTINCT subnet) as cnt FROM active_connections WHERE user_id = ?'
+					'SELECT COUNT(DISTINCT subnet) as cnt FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-5 minutes")'
 				).bind(user.id).first();
 				if (deviceCount && deviceCount.cnt >= user.max_connections) {
 					return false;
@@ -205,6 +205,8 @@ async function mgmtAddActiveConnection(env, uuid, connectionId, ipAddress, proto
 		await env.DB.prepare(
 			'INSERT INTO active_connections (user_id, connection_id, ip_address, subnet, protocol) VALUES (?, ?, ?, ?, ?)'
 		).bind(user.id, connectionId, ip, subnet, proto).run();
+		// Passive cleanup of stale connections on every new connection
+		mgmtCleanupStaleConnections(env).catch(() => {});
 		// Update current_connections = number of distinct subnets (devices) for this user
 		await env.DB.prepare(
 			'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ?) WHERE id = ?'
@@ -258,7 +260,7 @@ async function mgmtCleanupStaleConnections(env) {
 		if (result.changes > 0) {
 			// Update current_connections = distinct subnets for all users
 			await env.DB.prepare(
-				'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = users.id)'
+				'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-5 minutes"))'
 			).run();
 			console.log(`[CLEANUP] Removed ${result.changes} stale connections`);
 		}
@@ -501,12 +503,7 @@ async function mgmtVerifyAuth(request, env) {
         }
     }
 
-    // Fallback: If token looks like our generated token (alphanumeric, 16+ chars),
-    // accept it as valid (for cases where DB storage failed or token was truncated)
-    if (token.length >= 16 && /^[A-Za-z0-9]+$/.test(token)) {
-        return { adminId: 0, username: 'admin', role: 'superadmin', expiresAt: new Date(Date.now() + TOKEN_EXPIRY).toISOString() };
-    }
-
+    // SECURITY: No fallback acceptances. Only DB-stored session tokens are valid.
     return null;
 }
 
@@ -1195,21 +1192,36 @@ async function mgmtTestCleanIP(request, env) {
             try {
                 const headers = {};
                 if (sni) headers['Host'] = sni;
-                const response = await fetch(`https://${ip}:${port}`, {
+                const response = await fetch(`https://${ip}:${port}/`, {
                     method: 'HEAD',
                     headers,
+                    redirect: 'follow',
                     signal: AbortSignal.timeout(5000)
                 });
                 const latency = Date.now() - startTime;
-                let status = 'excellent';
-                if (!response.ok) status = response.status === 403 ? 'good' : 'poor';
-                return { status, latency, httpCode: response.status };
+                if (response.ok) return { status: 'excellent', latency, httpCode: response.status };
+                if (response.status === 403) return { status: 'good', latency, httpCode: response.status };
+                if (response.status === 1003) {
+                    try {
+                        const { connect } = await import('cloudflare:sockets');
+                        const socket = connect({ hostname: ip, port: parseInt(port) });
+                        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000));
+                        await Promise.race([socket.opened, timeoutPromise]);
+                        const sockLatency = Date.now() - startTime;
+                        socket.close();
+                        return { status: 'good', latency: sockLatency, httpCode: 200 };
+                    } catch (_) {
+                        return { status: 'poor', latency, httpCode: response.status };
+                    }
+                }
+                return { status: 'poor', latency, httpCode: response.status };
             } catch (e) {
-                if (e.name === 'TimeoutError' || e.code === 'ETIMEDOUT') {
+                const latency = Date.now() - startTime;
+                if (e.name === 'TimeoutError' || e.code === 'ETIMEDOUT' || e.message === 'timeout') {
                     return { status: 'timeout', latency: -1, httpCode: 0 };
                 }
                 if (e.message && (e.message.includes('certificate') || e.message.includes('TLS') || e.message.includes('ssl'))) {
-                    return { status: 'cert_error', latency: Date.now() - startTime, httpCode: 0 };
+                    return { status: 'cert_error', latency, httpCode: 0 };
                 }
                 return { status: 'unreachable', latency: -1, httpCode: 0 };
             }
@@ -1571,7 +1583,7 @@ async function mgmtHandleRequest(request, env, ctx) {
     const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
     const isWebSocket = upgradeHeader === 'websocket' || !!request.headers.get('Sec-WebSocket-Key');
 
-    // Let WebSocket and gRPC connections pass through to Edge Tunnel IMMEDIATELY
+    // Let WebSocket and gRPC connections pass through to ShadowGate IMMEDIATELY
     if (isWebSocket) return null;
 
     // Initialize management system only for non-WebSocket requests
@@ -1591,34 +1603,15 @@ async function mgmtHandleRequest(request, env, ctx) {
     // PUBLIC ROUTES
     // ============================================
 
-    // Serve admin panel
-    if ((path === '/' || path === '' || path === '/manager' || path === '/manager/') && method === 'GET') {
+    // ============================================
+    // HIDDEN ADMIN PANEL — secret path only
+    // Configurable via ADMIN_PATH var; default 'gate-x7k9p2'
+    // All other paths fall through to camouflage page
+    // ============================================
+    const mgmtSecretPath = '/' + String(env.ADMIN_PATH || 'gate-x7k9p2').replace(/^\/+|\/+$/g, '').toLowerCase();
+    if ((path === mgmtSecretPath || path === mgmtSecretPath + '/') && method === 'GET') {
         return new Response(mgmtAdminHTML(), {
             headers: { 'Content-Type': 'text/html;charset=utf-8', ...mgmtCorsHeaders() }
-        });
-    }
-
-    // Redirect root to /manager
-    if (path === '/' || path === '') {
-        return new Response(null, {
-            status: 302,
-            headers: { 'Location': '/manager', ...mgmtCorsHeaders() }
-        });
-    }
-
-    // Redirect /admin to /manager (prevent Edge Tunnel's admin page)
-    if (path === '/admin' || path === '/admin/' || path.startsWith('/admin/')) {
-        return new Response(null, {
-            status: 302,
-            headers: { 'Location': '/manager', ...mgmtCorsHeaders() }
-        });
-    }
-
-    // Redirect /login to /manager (prevent Edge Tunnel's login page)
-    if (path === '/login' || path === '/login/') {
-        return new Response(null, {
-            status: 302,
-            headers: { 'Location': '/manager', ...mgmtCorsHeaders() }
         });
     }
 
@@ -1668,7 +1661,7 @@ async function mgmtHandleRequest(request, env, ctx) {
                     const protocols = typeof user.protocols === 'string' ? JSON.parse(user.protocols || '{}') : (user.protocols || {});
                     const configs = [];
                     const host = url.hostname;
-                    const port = '443';
+                    const defaultPorts = ['443', '2053', '2096'];
 
                     // Build remark info for dummy nodes
                     const expireStr = user.expires_at ? user.expires_at.split(' ')[0] : 'Unlimited';
@@ -1702,14 +1695,20 @@ async function mgmtHandleRequest(request, env, ctx) {
                         : 4102329600;
                     const subUserinfo = `upload=0; download=${usedBytes}; total=${maxBytes}; expire=${expireUnix}`;
 
-                    if (protocols.vless !== false) {
-                        configs.push(`vless://${user.uuid}@${host}:${port}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'}`);
-                    }
-                    if (protocols.trojan !== false) {
-                        configs.push(`trojan://${user.uuid}@${host}:${port}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'}`);
-                    }
+                    // Anti-DPI parameters (fragmentation + custom cipher suites)
+                    const antiDpiParams = "&fp=unsafe&cs=TLS_AES_256_GCM_SHA384%3ATLS_CHACHA20_POLY1305_SHA256%3ATLS_AES_128_GCM_SHA256%3ATLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384%3ATLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384%3ATLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256%3ATLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256%3ATLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256%3ATLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_RSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256&fm=%7B%22tcp%22%3A%20%5B%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22packets%22%3A%20%22tlshello%22%2C%20%22lengths%22%3A%20%5B%225%22%2C%20%2294%22%2C%20%221%22%5D%2C%20%22delays%22%3A%20%5B%220%22%5D%2C%20%22maxSplit%22%3A%20%220%22%7D%7D%2C%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22packets%22%3A%20%221-1%22%2C%20%22lengths%22%3A%20%5B%22109%22%2C%20%221%22%5D%2C%20%22delays%22%3A%20%5B%221%22%5D%2C%20%22maxSplit%22%3A%20%22355%22%7D%7D%5D%7D";
 
-                    // Add Clean IP configs
+                    // ===== NORMAL CONFIGS (always generated, NO antiDpiParams) =====
+                    // Default host - Normal configs (all 3 ports)
+                    for (const port of defaultPorts) {
+                        if (protocols.vless !== false) {
+                            configs.push(`vless://${user.uuid}@${host}:${port}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowGate 🛡️ - ${user.username || 'user'} (Normal - ${port})`);
+                        }
+                        if (protocols.trojan !== false) {
+                            configs.push(`trojan://${user.uuid}@${host}:${port}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowGate 🛡️ - ${user.username || 'user'} (Normal - ${port})`);
+                        }
+                    }
+                    // Clean IPs - Normal configs (no port in remark, use c.name)
                     try {
                         const cleanResult = await env.DB.prepare('SELECT * FROM clean_ips WHERE is_active = 1 ORDER BY sort_order ASC, id ASC').all();
                         const cleanIPs = cleanResult.results || [];
@@ -1718,13 +1717,26 @@ async function mgmtHandleRequest(request, env, ctx) {
                             const cPort = c.port || 443;
                             const cSni = c.sni || host;
                             if (protocols.vless !== false) {
-                                configs.push(`vless://${user.uuid}@${cHost}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'}`);
+                                configs.push(`vless://${user.uuid}@${cHost}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowGate 🛡️ - ${user.username || 'user'} (${c.name})`);
                             }
                             if (protocols.trojan !== false) {
-                                configs.push(`trojan://${user.uuid}@${cHost}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'}`);
+                                configs.push(`trojan://${user.uuid}@${cHost}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowGate 🛡️ - ${user.username || 'user'} (${c.name})`);
                             }
                         }
                     } catch (_) { /* ignore clean IP errors */ }
+
+                    // ===== ANTI-FILTER CONFIGS (only if toggle enabled, WITH antiDpiParams) =====
+                    if (protocols.anti_filter === true) {
+                        const antiFilterPorts = ['443', '2053'];
+                        for (const port of antiFilterPorts) {
+                            if (protocols.vless !== false) {
+                                configs.push(`vless://${user.uuid}@${host}:${port}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D${antiDpiParams}#ShadowGate 🛡️ - ${user.username || 'user'} (Anti-Filter - ${port})🚀`);
+                            }
+                            if (protocols.trojan !== false) {
+                                configs.push(`trojan://${user.uuid}@${host}:${port}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D${antiDpiParams}#ShadowGate 🛡️ - ${user.username || 'user'} (Anti-Filter - ${port})🚀`);
+                            }
+                        }
+                    }
 
                     // Return as subscription (one config per line)
                     return new Response(configs.join('\n'), {
@@ -1761,9 +1773,9 @@ async function mgmtHandleRequest(request, env, ctx) {
         return mgmtGetUserStatus(uuid, env);
     }
 
-    // Bandwidth tracking API
+    // Bandwidth tracking API — DISABLED (was publicly writable; internal WS tracking is authoritative)
     if (path === '/api/user/track' && method === 'POST') {
-        return mgmtTrackBandwidthAPI(request, env);
+        return mgmtJsonResponse({ error: 'Not found' }, 404);
     }
 
     // ============================================
@@ -1918,7 +1930,7 @@ function mgmtAdminHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Edge Manager - پنل مدیریت</title>
+    <title>ShadowGate - پنل مدیریت</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         :root {
@@ -1935,7 +1947,9 @@ function mgmtAdminHTML() {
             --border: #334155;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: linear-gradient(135deg, #0f172a, #1e1b4b, #0f172a); background-size: 200% 200%; animation: gradientBG 15s ease infinite; color: var(--text-primary); min-height: 100vh; }
+@keyframes gradientBG { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+.login-form, .panel, .stat, .modal-content, .header, .nav { background: rgba(30, 41, 59, 0.4) !important; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1) !important; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); }
 
         /* Login */
         .login-box { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
@@ -1944,6 +1958,11 @@ function mgmtAdminHTML() {
         .login-form input { width: 100%; padding: 0.75rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: 0.5rem; background: var(--bg-primary); color: var(--text-primary); font-size: 1rem; }
         .login-form button { width: 100%; padding: 0.75rem; background: var(--accent); color: white; border: none; border-radius: 0.5rem; cursor: pointer; font-size: 1rem; font-weight: 600; }
         .login-form button:hover { background: var(--accent-hover); }
+        .pwd-wrap { position: relative; margin-bottom: 1rem; }
+        .pwd-wrap input { width: 100%; padding-right: 2.8rem !important; padding-left: 0.75rem; margin-bottom: 0 !important; box-sizing: border-box; }
+        .form-group .pwd-wrap { margin-bottom: 0; }
+        .pwd-eye { position: absolute; right: 0.35rem; left: auto; top: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; width: 1.8rem; height: 1.8rem; background: transparent; border: none; cursor: pointer; font-size: 1.15rem; line-height: 1; opacity: 0.85; user-select: none; z-index: 2; }
+        .pwd-eye:hover { opacity: 1; }
 
         /* Header */
         .header { background: var(--bg-secondary); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
@@ -1969,17 +1988,20 @@ function mgmtAdminHTML() {
         .stat .val.danger { color: var(--danger); }
 
         /* Buttons */
-        .btn { padding: 0.5rem 1rem; border: none; border-radius: 0.375rem; cursor: pointer; font-size: 0.875rem; margin: 0.25rem; transition: all 0.2s; }
-        .btn-primary { background: var(--accent); color: white; }
-        .btn-primary:hover { background: var(--accent-hover); }
-        .btn-success { background: var(--success); color: white; }
-        .btn-danger { background: var(--danger); color: white; }
-        .btn-warning { background: var(--warning); color: white; }
+        .btn { padding: 0.6rem 1.2rem; border: 1px solid rgba(255,255,255,0.1); border-radius: 0.5rem; cursor: pointer; font-size: 0.9rem; font-weight: 600; margin: 0.25rem; transition: all 0.2s; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+        .btn-primary { background: linear-gradient(135deg, rgba(59,130,246,0.8), rgba(37,99,235,0.9)); color: white; box-shadow: 0 0 15px rgba(59,130,246,0.4); }
+        .btn-primary:hover { background: linear-gradient(135deg, rgba(59,130,246,1), rgba(37,99,235,1)); box-shadow: 0 0 25px rgba(59,130,246,0.6); }
+        .btn-success { background: linear-gradient(135deg, rgba(16,185,129,0.8), rgba(5,150,105,0.9)); color: white; box-shadow: 0 0 15px rgba(16,185,129,0.4); }
+        .btn-success:hover { background: linear-gradient(135deg, rgba(16,185,129,1), rgba(5,150,105,1)); box-shadow: 0 0 25px rgba(16,185,129,0.6); }
+        .btn-danger { background: linear-gradient(135deg, rgba(239,68,68,0.8), rgba(220,38,38,0.9)); color: white; box-shadow: 0 0 15px rgba(239,68,68,0.4); }
+        .btn-danger:hover { background: linear-gradient(135deg, rgba(239,68,68,1), rgba(220,38,38,1)); box-shadow: 0 0 25px rgba(239,68,68,0.6); }
+        .btn-warning { background: linear-gradient(135deg, rgba(245,158,11,0.8), rgba(217,119,6,0.9)); color: white; box-shadow: 0 0 15px rgba(245,158,11,0.4); }
+        .btn-warning:hover { background: linear-gradient(135deg, rgba(245,158,11,1), rgba(217,119,6,1)); box-shadow: 0 0 25px rgba(245,158,11,0.6); }
         .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
-        .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-primary); }
+        .btn-outline { background: transparent !important; border: 1px solid var(--border) !important; color: var(--text-primary); }
 
         /* Table */
-        .table-container { overflow-x: auto; background: var(--bg-secondary); border-radius: 0.75rem; border: 1px solid var(--border); }
+        .table-container { overflow-x: auto; border-radius: 0.75rem; border: 1px solid var(--border); }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 0.75rem; text-align: right; border-bottom: 1px solid var(--border); }
         th { background: var(--bg-primary); color: var(--text-secondary); font-weight: 600; font-size: 0.8rem; }
@@ -2054,16 +2076,20 @@ function mgmtAdminHTML() {
 <body>
     <div id="loginPage" class="login-box">
         <div class="login-form">
-            <h1>🔐 Edge Manager</h1>
+            <h1>🔐 ShadowGate</h1>
             <input type="text" id="loginUsername" placeholder="نام کاربری" value="admin">
-            <input type="password" id="loginPassword" placeholder="رمز عبور" onkeypress="if(event.key==='Enter')doLogin()">
+            <div class="pwd-wrap">
+                <input type="password" id="loginPassword" placeholder="رمز عبور" onkeypress="if(event.key==='Enter')doLogin()" onkeyup="checkCapsLock(event)" onblur="hideCapsWarn()">
+                <span class="pwd-eye" role="button" tabindex="0" onclick="togglePwd('loginPassword', this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();togglePwd('loginPassword', this);}" title="نمایش رمز">👁️</span>
+            </div>
+            <div id="capsLockWarn" style="display:none;color:#ff6b6b;font-size:0.75rem;margin-top:-0.4rem;margin-bottom:0.3rem;">⚠️ Caps Lock روشن است!</div>
             <button onclick="doLogin()">ورود</button>
         </div>
     </div>
 
     <div id="dashboard" style="display:none">
         <div class="header">
-            <h1>⚡ Edge Manager</h1>
+            <h1>⚡ ShadowGate</h1>
             <div class="header-actions">
                 <button class="btn btn-outline btn-sm" onclick="refreshAll(this)">🔄 بروزرسانی</button>
                 <button class="btn btn-danger btn-sm" onclick="doLogout()">خروج</button>
@@ -2272,7 +2298,7 @@ function mgmtAdminHTML() {
                 <div style="background:var(--bg-secondary); padding:1.5rem; border-radius:0.75rem; border:1px solid var(--border); max-width:600px;">
                     <div class="form-group">
                         <label>نام سیستم</label>
-                        <input type="text" id="settingSystemName" value="Edge Manager">
+                        <input type="text" id="settingSystemName" value="ShadowGate">
                     </div>
                     <div class="form-group">
                         <label>آستانه هشدار حجم (%)</label>
@@ -2289,6 +2315,13 @@ function mgmtAdminHTML() {
                     <div class="form-group">
                         <label>آیدی ادمین تلگرام</label>
                         <input type="text" id="settingTelegramAdmin" placeholder="Chat ID">
+                    </div>
+                    <div class="form-group">
+                        <label>تغییر رمز عبور ادمین</label>
+                        <div class="pwd-wrap">
+                            <input type="password" id="settingAdminPassword" placeholder="رمز عبور جدید (برای عدم تغییر، خالی بگذارید)">
+                            <span class="pwd-eye" role="button" tabindex="0" onclick="togglePwd('settingAdminPassword', this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();togglePwd('settingAdminPassword', this);}" title="نمایش رمز">👁️</span>
+                        </div>
                     </div>
                     <button class="btn btn-primary" onclick="saveSettings()">💾 ذخیره تنظیمات</button>
                 </div>
@@ -2333,8 +2366,15 @@ function mgmtAdminHTML() {
                 </div>
                 <div class="form-group">
                     <label>یادداشت</label>
-                    <input type="text" id="newNotes" placeholder="اختیاری">
+                    <input type="text" id="newNotes">
                 </div>
+            </div>
+            <div class="form-group">
+                <label>کانفیگ‌های ضد فیلتر</label>
+                <select id="newAntiFilter">
+                    <option value="0">غیرفعال</option>
+                    <option value="1">فعال</option>
+                </select>
             </div>
             <div style="display:flex; gap:0.5rem;">
                 <button class="btn btn-primary" onclick="doCreateUser()" style="flex:1">ایجاد کاربر</button>
@@ -2397,6 +2437,16 @@ function mgmtAdminHTML() {
                 </div>
                 <div class="form-group"></div>
             </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>کانفیگ‌های ضد فیلتر</label>
+                    <select id="editAntiFilter">
+                        <option value="0">غیرفعال</option>
+                        <option value="1">فعال</option>
+                    </select>
+                </div>
+                <div class="form-group"></div>
+            </div>
             <div class="form-group">
                 <label>یادداشت</label>
                 <input type="text" id="editNotes">
@@ -2427,10 +2477,12 @@ function mgmtAdminHTML() {
                 </div>
             </div>
             <div class="config-box" id="subConfig">-</div>
+            
             <h3 style="margin:1rem 0 0.5rem;color:var(--accent);font-size:0.9rem">🌐 Clean IP ها</h3>
             <div id="cleanIPs" style="max-height:300px;overflow-y:auto"></div>
+            
             <div style="display:flex; gap:0.5rem;margin-top:1rem">
-                <button class="btn btn-primary" onclick="copyAllConfigs()" style="flex:2;background:var(--success)">📋 کپی همه کانفیگ‌ها</button>
+                <button class="btn btn-success" onclick="copyAllConfigs()" style="flex:2">📋 کپی همه کانفیگ‌ها</button>
                 <button class="btn btn-primary" onclick="copySubConfig()" style="flex:1">🔗 کپی لینک</button>
                 <button class="btn btn-danger" onclick="hideConfigModal()" style="flex:1">بستن</button>
             </div>
@@ -2537,9 +2589,31 @@ function mgmtAdminHTML() {
         // ============================================
         // AUTH
         // ============================================
+        function togglePwd(inputId, btn) {
+            const inp = document.getElementById(inputId);
+            if (!inp) return;
+            const show = inp.type === 'password';
+            inp.type = show ? 'text' : 'password';
+            btn.textContent = show ? '🙈' : '👁️';
+        }
+
+        function checkCapsLock(e) {
+            var el = document.getElementById('capsLockWarn');
+            if (!el) return;
+            if (e.getModifierState && e.getModifierState('CapsLock')) {
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+        function hideCapsWarn() {
+            var el = document.getElementById('capsLockWarn');
+            if (el) el.style.display = 'none';
+        }
+
         async function doLogin() {
-            const username = document.getElementById('loginUsername').value;
-            const password = document.getElementById('loginPassword').value;
+            const username = document.getElementById('loginUsername').value.trim();
+            const password = document.getElementById('loginPassword').value.trim();
             try {
                 const r = await fetch('/api/auth/login', {
                     method: 'POST',
@@ -2748,7 +2822,8 @@ function mgmtAdminHTML() {
                         expires_at: document.getElementById('newExpiry').value || null,
                         plan_id: document.getElementById('newPlan').value || null,
                         telegram_id: document.getElementById('newTelegramId').value || '',
-                        notes: document.getElementById('newNotes').value || ''
+                        notes: document.getElementById('newNotes').value || '',
+                        protocols: { vless: true, trojan: true, anti_filter: document.getElementById('newAntiFilter').value === '1' }
                     })
                 });
                 hideCreateModal();
@@ -2808,10 +2883,13 @@ function mgmtAdminHTML() {
                     document.getElementById('editMaxConn').value = u.max_connections || 1;
                     document.getElementById('editMaxBandwidth').value = u.max_bandwidth_bytes ? (u.max_bandwidth_bytes / (1024*1024*1024)).toFixed(1) : 0;
                     document.getElementById('editExpiry').value = u.expires_at ? u.expires_at.split(' ')[0].split('T')[0] : '';
-                    document.getElementById('editIsActive').value = u.is_active;
+                    document.getElementById('editIsActive').value = u.is_active ? '1' : '0';
                     document.getElementById('editTelegramId').value = u.telegram_id || '';
                     document.getElementById('editNotes').value = u.notes || '';
                     document.getElementById('editIsFrozen').value = u.is_frozen ? '1' : '0';
+                    let protos = {};
+                    try { protos = (typeof u.protocols === 'string' && u.protocols.trim() !== '') ? JSON.parse(u.protocols) : (u.protocols || {}); } catch(e) { protos = {}; }
+                    document.getElementById('editAntiFilter').value = protos.anti_filter ? '1' : '0';
                     if (u.plan_id) {
                         document.getElementById('editPlan').value = u.plan_id;
                     }
@@ -2857,7 +2935,8 @@ function mgmtAdminHTML() {
                 plan_id: document.getElementById('editPlan').value || null,
                 telegram_id: document.getElementById('editTelegramId').value || '',
                 notes: document.getElementById('editNotes').value || '',
-                is_frozen: parseInt(document.getElementById('editIsFrozen').value)
+                is_frozen: parseInt(document.getElementById('editIsFrozen').value),
+                protocols: { vless: true, trojan: true, anti_filter: document.getElementById('editAntiFilter').value === '1' }
             };
 
             try {
@@ -2941,7 +3020,7 @@ function mgmtAdminHTML() {
                         cleanHTML += '<div style="background:var(--bg-primary);padding:0.5rem;border-radius:0.5rem;margin-bottom:0.5rem">';
                         cleanHTML += '<div style="display:flex;justify-content:space-between;align-items:center">';
                         cleanHTML += '<span style="color:var(--accent);font-weight:600;font-size:0.85rem">' + ip.name + '</span>';
-                        cleanHTML += '<button class="btn btn-sm btn-outline" onclick="navigator.clipboard.writeText(' + "'" + ip.link.replace(/'/g, "\\'") + "'" + ');alert(' + "'" + 'کپی شد!' + "'" + ')">📋</button>';
+                        cleanHTML += '<button class="btn btn-sm btn-outline" onclick="safeCopy(' + "'" + ip.link.replace(/'/g, "\\'") + "'" + ')">📋</button>';
                         cleanHTML += '</div>';
                         cleanHTML += '<div style="font-size:0.75rem;color:var(--text-secondary);margin-top:0.25rem">' + ip.note + '</div>';
                         cleanHTML += '<div style="font-family:monospace;font-size:0.65rem;color:var(--text-secondary);word-break:break-all;margin-top:0.25rem;max-height:40px;overflow:hidden">' + ip.link + '</div>';
@@ -2953,26 +3032,41 @@ function mgmtAdminHTML() {
         }
 
         function hideConfigModal() { document.getElementById('configModal').classList.remove('active'); }
-        function copySubConfig() {
-            navigator.clipboard.writeText(document.getElementById('subConfig').textContent);
-            alert('کپی شد!');
+        function fallbackCopyText(text, msg) {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.top = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); alert(msg); } 
+            catch (err) { alert('❌ خطا در کپی'); }
+            document.body.removeChild(ta);
         }
+
+        function copySubConfig() {
+            var text = document.getElementById('subConfig').textContent;
+            var msg = '✅ کپی شد!';
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(function(){ alert(msg); }).catch(function(){ fallbackCopyText(text, msg); });
+            } else { fallbackCopyText(text, msg); }
+        }
+
+        function safeCopy(text) {
+            var msg = '✅ کپی شد!';
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(function(){ alert(msg); }).catch(function(){ fallbackCopyText(text, msg); });
+            } else { fallbackCopyText(text, msg); }
+        }
+
         var _currentCleanIPLinks = [];
         function copyAllConfigs() {
-            if (_currentCleanIPLinks.length === 0) { alert('کانفیگی برای کپی وجود ندارد'); return; }
+            if (!_currentCleanIPLinks || _currentCleanIPLinks.length === 0) { alert('کانفیگی برای کپی وجود ندارد'); return; }
             var allText = _currentCleanIPLinks.join('\\n');
-            navigator.clipboard.writeText(allText).then(function() {
-                alert('✅ ' + _currentCleanIPLinks.length + ' کانفیگ کپی شد!');
-            }).catch(function() {
-                // Fallback
-                var ta = document.createElement('textarea');
-                ta.value = allText;
-                document.body.appendChild(ta);
-                ta.select();
-                document.execCommand('copy');
-                document.body.removeChild(ta);
-                alert('✅ ' + _currentCleanIPLinks.length + ' کانفیگ کپی شد!');
-            });
+            var msg = '✅ ' + _currentCleanIPLinks.length + ' کانفیگ کپی شد!';
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(allText).then(function(){ alert(msg); }).catch(function(){ fallbackCopyText(allText, msg); });
+            } else { fallbackCopyText(allText, msg); }
         }
 
         // ============================================
@@ -3152,7 +3246,7 @@ function mgmtAdminHTML() {
                 const r = await fetch('/api/admin/settings', {headers: {'Authorization': 'Bearer ' + token}});
                 const d = await r.json();
                 if (d.settings) {
-                    document.getElementById('settingSystemName').value = d.settings.system_name || 'Edge Manager';
+                    document.getElementById('settingSystemName').value = d.settings.system_name || 'ShadowGate';
                     document.getElementById('settingTrafficAlert').value = d.settings.traffic_alert_threshold || 80;
                     document.getElementById('settingExpiryWarning').value = d.settings.expiry_warning_days || 7;
                     document.getElementById('settingTelegramToken').value = d.settings.telegram_bot_token || '';
@@ -3171,10 +3265,13 @@ function mgmtAdminHTML() {
                         traffic_alert_threshold: document.getElementById('settingTrafficAlert').value,
                         expiry_warning_days: document.getElementById('settingExpiryWarning').value,
                         telegram_bot_token: document.getElementById('settingTelegramToken').value,
-                        telegram_admin_id: document.getElementById('settingTelegramAdmin').value
+                        telegram_admin_id: document.getElementById('settingTelegramAdmin').value,
+                        admin_password: document.getElementById('settingAdminPassword').value || undefined
                     })
                 });
-                alert('تنظیمات ذخیره شد');
+                var pwd = document.getElementById('settingAdminPassword').value;
+                alert(pwd ? 'تنظیمات ذخیره شد. رمز عبور تغییر کرد — لطفاً دوباره وارد شوید.' : 'تنظیمات ذخیره شد');
+                document.getElementById('settingAdminPassword').value = '';
             } catch (e) { alert('خطا در ذخیره'); }
         }
 
@@ -3481,7 +3578,7 @@ function mgmtStatusHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>بررسی وضعیت - Edge Manager</title>
+    <title>بررسی وضعیت - ShadowGate</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: flex; justify-content: center; align-items: center; }
@@ -3568,7 +3665,7 @@ function mgmtStatusHTML() {
 // --- Cron Handler (from cron.js) ---
 // ============================================
 // CRON HANDLER
-// Scheduled tasks for Edge Manager
+// Scheduled tasks for ShadowGate
 // ============================================
 
 async function handleCron(env) {
@@ -4421,6 +4518,15 @@ async function migrateToV7(env) {
 
 export default {
 	async fetch(request, env, ctx) {
+		try {
+			return await this.__fetchImpl(request, env, ctx);
+		} catch (e) {
+			console.error('[ShadowGate FATAL]', e?.stack || String(e));
+			const showDebug = env && (env.DEBUG === '1' || env.DEBUG === 'true');
+			return new Response(showDebug ? ('ShadowGate Debug Error:\n\n' + ((e && e.stack) ? e.stack : String(e))) : 'error', { status: 500, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+		}
+	},
+	async __fetchImpl(request, env, ctx) {
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
 		const 请求URL锚点索引 = 请求URL文本.indexOf('#');
 		const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
@@ -4468,9 +4574,9 @@ export default {
 		const mgmtResponse = await mgmtHandleRequest(request, env, ctx);
 		if (mgmtResponse) return mgmtResponse;
 		} catch(e) {
-		// For WebSocket connections, always return null so Edge Tunnel can handle them
+		// For WebSocket connections, always return null so ShadowGate can handle them
 		if (isWebSocket) return null;
-		return new Response(JSON.stringify({error: 'MGMT ERROR: ' + e.message, stack: e.stack?.substring(0,500)}), {headers:{'Content-Type':'application/json'}});
+		return new Response(JSON.stringify({error: 'MGMT ERROR: ' + e.message}), {headers:{'Content-Type':'application/json'}});
 		}
 
 		// ============================================
@@ -4516,7 +4622,7 @@ export default {
 			} catch(wsErr) {
 			const errMsg = wsErr instanceof Error ? wsErr.message : String(wsErr);
 			const errStack = wsErr instanceof Error ? (wsErr.stack || '').substring(0,500) : '';
-			return new Response(JSON.stringify({error: 'WS_ERROR', message: errMsg, stack: errStack}), {status:500, headers:{'Content-Type':'application/json'}});
+			return new Response(JSON.stringify({error: 'WS_ERROR', message: errMsg}), {status:500, headers:{'Content-Type':'application/json'}});
 			}
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/XHTTP代理
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
@@ -4537,7 +4643,7 @@ export default {
 					const params = new URLSearchParams(url.search);
 					params.set('token', await MD5MD5(host + userID));
 					return new Response('重定向中...', { status: 302, headers: { 'Location': `/sub?${params.toString()}` } });
-				} else if (访问路径 === 'login') {//处理登录页面和登录请求
+				} else if (false && 访问路径 === 'login') {//处理登录页面和登录请求 (DISABLED: stealth camouflage mode)
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
 					if (authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/admin' } });
@@ -4553,7 +4659,7 @@ export default {
 						}
 					}
 					return fetch(Pages静态页面 + '/login');
-				} else if (访问路径 === 'admin' || 访问路径.startsWith('admin/')) {//验证cookie后响应管理页面
+				} else if (false && (访问路径 === 'admin' || 访问路径.startsWith('admin/'))) {//验证cookie后响应管理页面 (DISABLED: stealth camouflage mode)
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
 					// 没有cookie或cookie错误，跳转到/login页面
@@ -4760,7 +4866,7 @@ export default {
 						// If D1 user found, override userID and let subscription through
 						// ============================================
 						if (managementUserID && managementUserID !== userID.toLowerCase()) {
-							// Override the userID for this request so Edge Tunnel uses D1 user's UUID
+							// Override the userID for this request so ShadowGate uses D1 user's UUID
 							userID = managementUserID;
 							// Let the subscription proceed
 							用户客户端请求订阅 = true;
@@ -4963,7 +5069,7 @@ export default {
 			} else if (!envUUID) return fetch(Pages静态页面 + '/noKV').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
 		}
 
-		let 伪装页URL = env.URL || 'nginx';
+		let 伪装页URL = env.URL || 'https://example.com/';
 		if (伪装页URL && 伪装页URL !== 'nginx' && 伪装页URL !== '1101') {
 			伪装页URL = 伪装页URL.trim().replace(/\/$/, '');
 			if (!伪装页URL.match(/^https?:\/\//i)) 伪装页URL = 'https://' + 伪装页URL;
@@ -4987,6 +5093,10 @@ export default {
 			return 反代响应;
 		} catch (error) { }
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+	},
+	// Cron Handler - Runs on schedule (restored; was accidentally swallowed into html1101 template)
+	async scheduled(event, env, ctx) {
+		ctx.waitUntil(handleCron(env).catch(e => console.error('[Cron]', e?.message || e)));
 	}
 };
 ///////////////////////////////////////////////////////////////////////XHTTP传输数据///////////////////////////////////////////////
@@ -5829,7 +5939,6 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
 	const SS模式禁用EarlyData = !!url.searchParams.get('enc');
 	let WS上行写入队列 = null;
-	let WS显式传输链 = Promise.resolve();
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
@@ -6368,9 +6477,32 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 		closeSocketQuietly(serverSock);
 	};
 
-	const 追加WS显式传输任务 = (任务) => {
-		WS显式传输链 = WS显式传输链.then(任务).catch(处理WS显式传输错误);
-		return WS显式传输链;
+	let WS显式队列 = [];
+	let WSدر_حال_پردازش = false;
+
+	const پردازش_صف_WS = async () => {
+		if (WSدر_حال_پردازش) return;
+		WSدر_حال_پردازش = true;
+		try {
+			while (WS显式队列.length > 0) {
+				if (WS显式传输失败) break;
+				const data = WS显式队列.shift();
+				const chunkSize = Math.max(0, 有效数据长度(data));
+				WS显式队列字节 = Math.max(0, WS显式队列字节 - chunkSize);
+				WS显式队列条目 = Math.max(0, WS显式队列条目 - 1);
+				await 处理WS入站数据(data);
+			}
+		} catch (err) {
+			处理WS显式传输错误(err);
+		} finally {
+			WSدر_حال_پردازش = false;
+			if (WS显式传输收尾已入队 && WS显式队列.length === 0 && !WS显式传输失败) {
+				await 上行写入队列.等待空();
+				释放远端写入器();
+				失效远端连接();
+				try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
+			}
+		}
 	};
 
 	const 入队WS显式传输 = (data) => {
@@ -6384,25 +6516,17 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 		}
 		WS显式队列字节 = nextBytes;
 		WS显式队列条目 = nextItems;
-		追加WS显式传输任务(async () => {
-			WS显式队列字节 = Math.max(0, WS显式队列字节 - chunkSize);
-			WS显式队列条目 = Math.max(0, WS显式队列条目 - 1);
-			if (WS显式传输失败) return;
-			await 处理WS入站数据(data);
-		});
+		WS显式队列.push(data);
+		پردازش_صف_WS();
 	};
 
 	const 收尾WS显式传输 = () => {
 		if (WS显式传输收尾已入队) return;
 		WS显式传输收尾已入队 = true;
 		WS显式传输停止接收 = true;
-		追加WS显式传输任务(async () => {
-			if (WS显式传输失败) return;
-			await 上行写入队列.等待空();
-			释放远端写入器();
-			失效远端连接();
-			try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
-		});
+		if (!WSدر_حال_پردازش && WS显式队列.length === 0) {
+			پردازش_صف_WS(); // Trigger final cleanup if queue is already empty
+		}
 	};
 
 	serverSock.addEventListener('message', (event) => {
@@ -11243,15 +11367,7 @@ async function html1101(host, 访问IP) {
     </div><!-- /#cf-wrapper -->
 
      <script>
-    window._cf_translation = {
-	},
-
-	// Cron Handler - Runs on schedule
-	async scheduled(event, env, ctx) {
-		ctx.waitUntil(handleCron(env));
-	}};
-
-
+    window._cf_translation = {};
   </script>
 </body>
 </html>`;

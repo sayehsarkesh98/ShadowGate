@@ -1,6 +1,6 @@
 // ============================================
 // CRON HANDLER
-// Scheduled tasks for Edge Manager
+// Scheduled tasks for ShadowGate
 // ============================================
 
 export async function handleCron(env) {
