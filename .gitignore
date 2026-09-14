@@ -1,6 +1,7 @@
 node_modules/
 .wrangler/
 wrangler.toml
+wrangler.*.toml
 _worker (1).js
 src/merged-worker.js
 *.pyc

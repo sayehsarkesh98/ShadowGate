@@ -118,47 +118,6 @@ async function 获取活跃UUID列表(env) {
 function clearUUIDCache() {
     activeUUIDsCache = null;
     activeUUIDsCacheTime = 0;
-    userStatusCache = null;
-    userStatusCacheTime = 0;
-}
-
-// ============================================
-// USER CACHE (60s) — mgmtValidateUUID hit this on EVERY WebSocket
-// open (SELECT * FROM users + subnet/device COUNT queries). With browsers
-// opening dozens of WS per page load, that's thousands of redundant D1
-// reads per user per day. Cache the enforcement decision per (uuid) instead.
-// ============================================
-const USER_CACHE_TTL = 60 * 1000;
-let userStatusCache = null;   // Map: uuid -> { data: userRow, expires: ts }
-let userStatusCacheTime = 0;
-
-async function getCachedUser(env, uuid) {
-    const now = Date.now();
-    if (!userStatusCache || now - userStatusCacheTime > USER_CACHE_TTL) {
-        userStatusCache = new Map();
-        userStatusCacheTime = now;
-    }
-    const hit = userStatusCache.get(uuid);
-    if (hit && hit.expires > now) return hit.data;
-    try {
-        const user = await env.DB.prepare(
-            'SELECT id, uuid, is_active, is_frozen, expires_at, max_bandwidth_bytes, max_bandwidth_mb, used_bandwidth_bytes, max_connections FROM users WHERE uuid = ?'
-        ).bind(uuid).first();
-        if (user) {
-            userStatusCache.set(uuid, { data: user, expires: now + USER_CACHE_TTL });
-            return user;
-        }
-    } catch (e) {
-        console.error(`[UserCache] lookup error: ${e.message}`);
-    }
-    return null;
-}
-
-function invalidateUserCache(uuid) {
-    if (userStatusCache) {
-        if (uuid) userStatusCache.delete(uuid);
-        else userStatusCache.clear();
-    }
 }
 
 // ============================================
@@ -183,10 +142,11 @@ function getSubnetGroup(ip) {
 async function mgmtValidateUUID(env, uuid, clientIP, protocol) {
 	try {
 		if (!env.DB) return false;
-		// Cached user row (60s TTL): this runs on EVERY proxied connection open and
-		// previously did a full SELECT * per call — thousands of redundant D1 reads/day.
-		const user = await getCachedUser(env, uuid);
-		if (!user || user.is_active !== 1) return false;
+		const user = await env.DB.prepare(
+			'SELECT * FROM users WHERE uuid = ? AND is_active = 1'
+		).bind(uuid).first();
+
+		if (!user) return false;
 
 		// Check if frozen
 		if (user.is_frozen) return false;
@@ -196,10 +156,7 @@ async function mgmtValidateUUID(env, uuid, clientIP, protocol) {
 			return false;
 		}
 
-		// Check bandwidth limit (v2: use max_bandwidth_bytes).
-		// NOTE: used_bandwidth_bytes now advances in 100MB/5min flushes, so a user may
-		// overshoot by up to one buffer between writes; hard cutoff happens at flush
-		// time (checkBandwidthAlerts auto-disable) — accept the small window.
+		// Check bandwidth limit (v2: use max_bandwidth_bytes)
 		const maxBW = user.max_bandwidth_bytes || (user.max_bandwidth_mb || 0) * 1024 * 1024;
 		if (maxBW > 0) {
 			if (user.used_bandwidth_bytes >= maxBW) {
@@ -207,119 +164,105 @@ async function mgmtValidateUUID(env, uuid, clientIP, protocol) {
 			}
 		}
 
-		// Check connection limit — count distinct subnet groups as devices.
-		// In-isolate device set first (fresh, zero D1 cost), then the D1 device rows
-		// (shared across isolates) as fallback.
+		// Check connection limit — count distinct subnet groups as devices
 		if (user.max_connections > 0) {
 			const subnet = getSubnetGroup(clientIP);
-			const buffer = bwBuffer.get(uuid);
-			const localDevices = buffer ? [...buffer.devices] : [];
-			if (localDevices.length >= user.max_connections && !localDevices.includes(subnet)) {
-				return false;
-			}
-			const deviceRows = await env.DB.prepare(
-				'SELECT DISTINCT subnet FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes") LIMIT ?'
-			).bind(user.id, (user.max_connections || 1) + 1).all();
-			const dbDevices = (deviceRows.results || []).map(r => r.subnet).filter(s => s);
-			const allDevices = new Set([...localDevices, ...dbDevices]);
-			if (allDevices.size >= user.max_connections && !allDevices.has(subnet)) {
-				return false;
+			// Check if this subnet already has an active connection
+			const existing = await env.DB.prepare(
+				'SELECT id FROM active_connections WHERE user_id = ? AND subnet = ? LIMIT 1'
+			).bind(user.id, subnet).first();
+
+			if (!existing) {
+				// New subnet — check if we have room
+				const deviceCount = await env.DB.prepare(
+					'SELECT COUNT(DISTINCT subnet) as cnt FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-5 minutes")'
+				).bind(user.id).first();
+				if (deviceCount && deviceCount.cnt >= user.max_connections) {
+					return false;
+				}
 			}
 		}
 
 		return true;
 	} catch (e) {
-		// D1 unavailable (e.g. daily write limit exhausted) → fail OPEN so the tunnel
-		// keeps working without quota enforcement instead of dying with the database.
-		console.error('UUID validation error (fail-open):', e);
-		return true;
+		console.error('UUID validation error:', e);
+		return false;
 	}
 }
 
-// ============================================
-// DEVICE-GRAINED CONNECTION TRACKING
-// ============================================
-// Previously: one row PER WebSocket (browsers open dozens per page — thousands of
-// rows/day), each INSERT/DELETE paired with its own UPDATE of users.current_connections.
-// Now: one row per (user, subnet) DEVICE, kept fresh by the periodic flush.
-// Row key is `user_id:subnet` in connection_id. The users.current_connections /
-// is_online refresh rides along with the bandwidth flush batch (see flushBandwidth)
-// and the stale cleanup, so no separate per-connection UPDATEs at all.
-
+// Add connection to active_connections table
+// Each WebSocket gets its own row identified by connection_id
+// Device counting uses subnet grouping (/24 for IPv4, /64 for IPv6)
 async function mgmtAddActiveConnection(env, uuid, connectionId, ipAddress, protocol) {
 	try {
 		if (!env.DB) return true;
-		const user = await getCachedUser(env, uuid);
+		const user = await env.DB.prepare('SELECT id FROM users WHERE uuid = ?').bind(uuid).first();
 		if (!user) return false;
 		const ip = ipAddress || 'unknown';
 		const proto = protocol || 'vless';
 		const subnet = getSubnetGroup(ip);
-		// Register the device in the bandwidth buffer too, so the flush's
-		// users.is_online / current_connections update covers this connect
-		// without a dedicated write.
-		const e = bufferEntry(uuid);
-		e.devices.add(subnet);
-		if (!e.firstTs) e.firstTs = Date.now();
-		// One upsert per DEVICE (per user+subnet), not per socket. Repeated connects
-		// from the same device just bump last_activity — one write either way.
+		// Insert new row for this specific connection (each WS = one row)
 		await env.DB.prepare(
-			`INSERT INTO active_connections (user_id, connection_id, ip_address, subnet, protocol, connected_at, last_activity)
-			 VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-			 ON CONFLICT(connection_id) DO UPDATE SET last_activity = datetime('now'), ip_address = excluded.ip_address, protocol = excluded.protocol`
-		).bind(user.id, user.id + ':' + subnet, ip, subnet, proto).run();
-		// Passive cleanup of stale connections — throttled to at most once per minute
-		// (it used to run on EVERY new connection; each pass costs 1 DELETE + 1 big
-		// UPDATE per dirty user, which together with per-WS connect bookkeeping was
-		// burning through D1's free-tier 100k daily row-write limit in hours).
-		mgmtMaybeCleanupStaleConnections(env).catch(() => {});
+			'INSERT INTO active_connections (user_id, connection_id, ip_address, subnet, protocol) VALUES (?, ?, ?, ?, ?)'
+		).bind(user.id, connectionId, ip, subnet, proto).run();
+		// Passive cleanup of stale connections on every new connection
+		mgmtCleanupStaleConnections(env).catch(() => {});
+		// Update current_connections = number of distinct subnets (devices) for this user
+		await env.DB.prepare(
+			'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ?) WHERE id = ?'
+		).bind(user.id, user.id).run();
 		return true;
 	} catch (e) {
-		// D1 write failed (quota exhausted, transient error) → fail OPEN: allow the
-		// connection untracked rather than killing the tunnel with the database.
-		console.error('Add active connection error (fail-open):', e);
-		return true;
+		console.error('Add active connection error:', e);
+		return false;
 	}
 }
 
-// Remove a device row — only when its connection closes AND no other socket from
-// the same device is still open (the 10s grace on last_activity decides: a fresh
-// row means another socket from that device is probably still active).
+// Remove a specific connection by connection_id (not by IP)
+// Recomputes device count using subnet grouping
 async function mgmtRemoveActiveConnection(env, uuid, connectionId, protocol) {
 	try {
 		if (!env.DB) return;
-		const user = await getCachedUser(env, uuid);
+		const user = await env.DB.prepare('SELECT id FROM users WHERE uuid = ?').bind(uuid).first();
 		if (!user) return;
-		// Device keys are `<numeric user_id>:<subnet>`; the subnet itself may contain
-		// colons (IPv6 ::/64), so split at the FIRST colon, not the last.
-		const sep = connectionId.indexOf(':');
-		const subnet = sep === -1 ? connectionId : connectionId.slice(sep + 1);
 		await env.DB.prepare(
-			"DELETE FROM active_connections WHERE connection_id = ? AND last_activity < datetime('now', '-10 seconds')"
-		).bind(user.id + ':' + subnet).run();
+			'DELETE FROM active_connections WHERE connection_id = ?'
+		).bind(connectionId).run();
+		// Update current_connections = distinct subnets (devices)
+		await env.DB.prepare(
+			'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ?) WHERE id = ?'
+		).bind(user.id, user.id).run();
 	} catch (e) {
 		console.error('Remove active connection error:', e);
 	}
 }
 
-// (device-row heartbeat rides in flushBandwidth's batch — per-connection heartbeat removed)
+// Heartbeat: update last_activity to prevent stale cleanup for idle connections
+async function mgmtHeartbeatConnection(env, connectionId) {
+	try {
+		if (!env.DB || !connectionId) return;
+		await env.DB.prepare(
+			"UPDATE active_connections SET last_activity = datetime('now') WHERE connection_id = ?"
+		).bind(connectionId).run();
+	} catch (e) {
+		console.error('Heartbeat connection error:', e);
+	}
+}
 
+// Clean up stale connections (older than 5 minutes)
 async function mgmtCleanupStaleConnections(env) {
 	try {
 		if (!env.DB) return;
-		// Delete DEVICE rows not refreshed for 10 minutes (device rows are now
-		// heartbeated by the 5-min bandwidth flush instead of per-5MB chunks, so the
-		// purge window grew with it; 10 min tolerates an idle-but-open device).
-		// Rows freshened by a newer isolate still survive — last_activity is shared via D1.
+		// Delete connections older than 5 minutes
 		const result = await env.DB.prepare(
-			"DELETE FROM active_connections WHERE last_activity < datetime('now', '-10 minutes')"
+			"DELETE FROM active_connections WHERE last_activity < datetime('now', '-5 minutes')"
 		).run();
 		if (result.changes > 0) {
-			// Update current_connections = distinct subnets for all users; users whose
-			// last live connection expired drop the online flag here too.
+			// Update current_connections = distinct subnets for all users
 			await env.DB.prepare(
-				'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes")), is_online = CASE WHEN (SELECT COUNT(*) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes")) = 0 THEN 0 ELSE is_online END, last_online_at = CASE WHEN (SELECT COUNT(*) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes")) = 0 THEN datetime("now") ELSE last_online_at END'
+				'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-5 minutes"))'
 			).run();
-			console.log(`[CLEANUP] Removed ${result.changes} stale device rows`);
+			console.log(`[CLEANUP] Removed ${result.changes} stale connections`);
 		}
 	} catch (e) {
 		console.error('Cleanup stale connections error:', e);
@@ -330,162 +273,69 @@ async function mgmtCleanupStaleConnections(env) {
 // BANDWIDTH TRACKING
 // ============================================
 
-// ============================================
-// BUFFERED BANDWIDTH ACCOUNTING (D1 write diet)
-// ============================================
-// Previously every 5MB flushed straight to D1: one upsert into bandwidth_usage,
-// one UPDATE on users, plus a SELECT inside checkBandwidthAlerts — and every
-// short-lived browser WebSocket added its own connect/close writes. Two active
-// users burned ~25k row-writes/day (limit: 100k). Now traffic accumulates in an
-// in-isolate buffer and ONE D1 batch is written per BW_BUFFER_THRESHOLD bytes or
-// per BW_BUFFER_MAX_AGE (whichever comes first); connect counts ride along in the
-// same batch instead of their own UPDATEs.
-const BW_BUFFER_THRESHOLD = 100 * 1024 * 1024; // flush every 100MB
-const BW_BUFFER_MAX_AGE = 5 * 60 * 1000;       // ...or every 5 min while active
-const BW_BUFFER_CLOSE_MIN = 5 * 1024 * 1024;   // at connection close: flush if >=5MB buffered
-const BW_BUFFER_CLOSE_AGE = 3 * 60 * 1000;     // ...or buffer older than 3 min
-const bwBuffer = new Map(); // uuid -> { up, down, connects, devices, firstTs, lastTs, flushing }
-
-function bufferEntry(uuid) {
-    let e = bwBuffer.get(uuid);
-    if (!e) {
-        e = { up: 0, down: 0, connects: 0, devices: new Set(), firstTs: 0, lastTs: 0, flushing: false };
-        bwBuffer.set(uuid, e);
-    }
-    return e;
-}
-
-async function flushBandwidth(env, uuid, closing) {
-    const e = bwBuffer.get(uuid);
-    if (!e || e.flushing) return;
-    const up = e.up, down = e.down, connects = e.connects;
-    const age = e.firstTs ? Date.now() - e.firstTs : 0;
-    const total = up + down;
-    if (connects === 0 && total === 0) return;
-    // Thresholds: mid-session we only write every 100MB / 5min. On connection
-    // close we flush sooner (5MB / 3min) so brief sessions still land in D1
-    // before the isolate can be evicted with the buffer unsaved.
-    const shouldFlush = closing
-        ? (total >= BW_BUFFER_CLOSE_MIN || (age >= BW_BUFFER_CLOSE_AGE && total > 0) || (total === 0 && connects > 0))
-        : (total >= BW_BUFFER_THRESHOLD || age >= BW_BUFFER_MAX_AGE);
-    if (!shouldFlush) return;
-
-    e.flushing = true;
-    e.up = 0; e.down = 0; e.connects = 0; e.firstTs = 0;
-    try {
-        const user = await env.DB.prepare(
-            'SELECT id, used_bandwidth_bytes, max_bandwidth_bytes, max_bandwidth_mb, is_active FROM users WHERE uuid = ?'
-        ).bind(uuid).first();
-        if (!user) return;
-
-        // Day key in Asia/Tehran time — a UTC day rolls over at 03:30 local, which made
-        // "ترافیک امروز" show yesterday's traffic for most of the Iranian morning.
-        let today;
-        try {
-            today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tehran' }).format(new Date());
-        } catch (e2) {
-            today = new Date().toISOString().split('T')[0];
-        }
-
-        // Apply 5% network overhead compensation (TCP/IP + TLS headers)
-        const compensatedUp = Math.ceil(up * 1.05);
-        const compensatedDown = Math.ceil(down * 1.05);
-        const compensatedTotal = compensatedUp + compensatedDown;
-        const connDelta = connects;
-
-        // ONE round-trip for: daily rollup + user total + connect counter + online/device state
-        await env.DB.batch([
-            env.DB.prepare(`
-                INSERT INTO bandwidth_usage (user_id, date, bytes_up, bytes_down, total_bytes, request_count)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, date)
-                DO UPDATE SET
-                    bytes_up = bytes_up + ?,
-                    bytes_down = bytes_down + ?,
-                    total_bytes = total_bytes + ?,
-                    request_count = request_count + ?
-            `).bind(user.id, today, compensatedUp, compensatedDown, compensatedTotal, Math.max(connDelta, 0),
-                compensatedUp, compensatedDown, compensatedTotal, Math.max(connDelta, 0)),
-            env.DB.prepare(
-                'UPDATE users SET used_bandwidth_bytes = used_bandwidth_bytes + ?, total_requests = total_requests + ?, is_online = 1, last_online_at = datetime("now"), last_used_at = datetime("now"), current_connections = (SELECT COUNT(*) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")) WHERE id = ?'
-            ).bind(compensatedTotal, Math.max(connDelta, 0), user.id, user.id),
-            // Device-row heartbeat: flushes fire every 100MB/5min while traffic flows,
-            // so this keeps idle-but-open devices from being purged by the 10-min
-            // cleanup. Replaces the old per-5MB mgmtHeartbeatConnection writes.
-            env.DB.prepare(
-                "UPDATE active_connections SET last_activity = datetime('now') WHERE user_id = ?"
-            ).bind(user.id),
-        ]);
-        invalidateUserCache(uuid);
-        await checkBandwidthAlerts(env, user.id, uuid, (user.used_bandwidth_bytes || 0) + compensatedTotal);
-    } catch (err) {
-        console.error('Bandwidth flush error:', err);
-        // Write failed (quota/transient) — put the bytes back so they're billed on the next flush.
-        const cur = bwBuffer.get(uuid);
-        if (cur) { cur.up += up; cur.down += down; cur.connects += connects; if (!cur.firstTs) cur.firstTs = Date.now() - BW_BUFFER_MAX_AGE + 30 * 1000; }
-    } finally {
-        const cur = bwBuffer.get(uuid);
-        if (cur) { cur.flushing = false; cur.lastTs = Date.now(); }
-    }
-}
-
-// Increment request count per connection — now just a buffered counter,
-// written to D1 inside flushBandwidth's batch instead of its own UPDATE.
-async function mgmtIncrementRequestCount(env, uuid) {
-    try {
-        if (!env.DB || !uuid) return;
-        const e = bufferEntry(uuid);
-        e.connects += 1;
-        if (!e.firstTs) e.firstTs = Date.now();
-    } catch (e) {
-        console.error("Request count error:", e);
-    }
-}
-
-// Bandwidth tracking for management system — buffered, see header comment.
-async function mgmtTrackBandwidth(env, uuid, bytesUp, bytesDown, opts = {}) {
+async function mgmtTrackBandwidth(env, uuid, bytesUp, bytesDown) {
     try {
         if (!env.DB) return;
         const up = bytesUp || 0;
         const down = bytesDown || 0;
         if (up <= 0 && down <= 0) return;
-        const e = bufferEntry(uuid);
-        e.up += up;
-        e.down += down;
-        if (!e.firstTs) e.firstTs = Date.now();
-        e.lastTs = Date.now();
-        await flushBandwidth(env, uuid, !!opts.closing);
+
+        const user = await env.DB.prepare(
+            'SELECT id FROM users WHERE uuid = ?'
+        ).bind(uuid).first();
+
+        if (!user) return;
+
+        const today = new Date().toISOString().split('T')[0];
+
+        // Apply 5% network overhead compensation (TCP/IP + TLS headers)
+        const compensatedUp = Math.ceil(up * 1.05);
+        const compensatedDown = Math.ceil(down * 1.05);
+        const compensatedTotal = compensatedUp + compensatedDown;
+
+        // Update bandwidth_usage table with separate up/down tracking
+        await env.DB.prepare(`
+            INSERT INTO bandwidth_usage (user_id, date, bytes_up, bytes_down, total_bytes, request_count)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ON CONFLICT(user_id, date)
+            DO UPDATE SET
+                bytes_up = bytes_up + ?,
+                bytes_down = bytes_down + ?,
+                total_bytes = total_bytes + ?,
+                request_count = request_count + 1
+        `).bind(user.id, today, compensatedUp, compensatedDown, compensatedTotal,
+            compensatedUp, compensatedDown, compensatedTotal).run();
+
+        // Update user's total used bandwidth
+        await env.DB.prepare(
+            'UPDATE users SET used_bandwidth_bytes = used_bandwidth_bytes + ?, last_used_at = datetime("now") WHERE id = ?'
+        ).bind(compensatedTotal, user.id).run();
+
+        // Check for bandwidth alerts
+        await checkBandwidthAlerts(env, user.id, uuid);
     } catch (e) {
         console.error('Bandwidth tracking error:', e);
     }
 }
 
-// Log a connection event — deduplicated in-memory: a browser opens dozens of
-// WebSockets per minute (one per proxied TCP connection), and logging each one
-// was the single biggest contributor to D1's daily row-write limit burning out.
-// Keep one log entry per (uuid, IP, host) per 15 minutes; the rest are skipped.
-const mgmtLogDedupe = new Map();
-const MGMT_LOG_DEDUPE_MS = 15 * 60 * 1000;
-const MGMT_LOG_DEDUPE_MAX = 500;
+// Increment request count per connection (once per connection, not per chunk)
+async function mgmtIncrementRequestCount(env, uuid) {
+    try {
+        if (!env.DB || !uuid) return;
+        const user = await env.DB.prepare('SELECT id FROM users WHERE uuid = ?').bind(uuid).first();
+        if (!user) return;
+        await env.DB.prepare(
+            'UPDATE users SET total_requests = total_requests + 1 WHERE id = ?'
+        ).bind(user.id).run();
+    } catch (e) {
+        console.error('Request count error:', e);
+    }
+}
+
+// Log a connection event
 async function mgmtLogConnection(env, uuid, eventType, protocol, ipAddress, details) {
     try {
-        if (!env.DB || eventType !== 'connect') { /* non-connect events always log */ }
-        else {
-            const key = uuid + '|' + (ipAddress || '') + '|' + (details || '');
-            const now = Date.now();
-            const last = mgmtLogDedupe.get(key);
-            if (last && now - last < MGMT_LOG_DEDUPE_MS) return;
-            mgmtLogDedupe.set(key, now);
-            if (mgmtLogDedupe.size > MGMT_LOG_DEDUPE_MAX) {
-                for (const [k, t] of mgmtLogDedupe) {
-                    if (now - t >= MGMT_LOG_DEDUPE_MS) mgmtLogDedupe.delete(k);
-                }
-                // Still over: drop oldest entries (Map preserves insertion order)
-                while (mgmtLogDedupe.size > MGMT_LOG_DEDUPE_MAX) {
-                    mgmtLogDedupe.delete(mgmtLogDedupe.keys().next().value);
-                }
-            }
-        }
+        if (!env.DB) return;
         const user = await env.DB.prepare('SELECT id FROM users WHERE uuid = ?').bind(uuid).first();
         if (!user) return;
         await env.DB.prepare(
@@ -496,52 +346,28 @@ async function mgmtLogConnection(env, uuid, eventType, protocol, ipAddress, deta
     }
 }
 
-async function checkBandwidthAlerts(env, userId, uuid, usedBytesOverride) {
+async function checkBandwidthAlerts(env, userId, uuid) {
     try {
-        // Called right after a bandwidth flush (now every 100MB / 5min). The 80%
-        // alert used to INSERT a notification_queue row on each pass once past
-        // the threshold — thousands of rows/day for an active user. Once per 6h is plenty.
-        const now = Date.now();
-        const lastAlert = (checkBandwidthAlerts._last = checkBandwidthAlerts._last || new Map()).get(userId) || 0;
-        const shouldNotify = now - lastAlert > 6 * 60 * 60 * 1000;
+        const user = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+        if (!user) return;
 
-        // usedBytesOverride: caller (flushBandwidth) already has the post-flush total
-        // from the same SELECT it needed for the batch — skip the extra read here.
-        let maxBW, usedBytes, isActive;
-        if (usedBytesOverride !== undefined) {
-            const cached = await getCachedUser(env, uuid);
-            if (!cached) return;
-            maxBW = cached.max_bandwidth_bytes || (cached.max_bandwidth_mb || 0) * 1024 * 1024;
-            usedBytes = usedBytesOverride;
-            isActive = cached.is_active === 1;
-        } else {
-            const user = await env.DB.prepare('SELECT max_bandwidth_bytes, max_bandwidth_mb, used_bandwidth_bytes, is_active FROM users WHERE id = ?').bind(userId).first();
-            if (!user) return;
-            maxBW = user.max_bandwidth_bytes || (user.max_bandwidth_mb || 0) * 1024 * 1024;
-            usedBytes = user.used_bandwidth_bytes;
-            isActive = user.is_active === 1;
-        }
+        const maxBW = user.max_bandwidth_bytes || (user.max_bandwidth_mb || 0) * 1024 * 1024;
         if (maxBW <= 0) return;
 
-        const usagePercent = (usedBytes / maxBW) * 100;
-        if (usagePercent < 80) return;
-
+        const usagePercent = (user.used_bandwidth_bytes / maxBW) * 100;
         const threshold = parseInt(await getSetting(env, 'traffic_alert_threshold') || '80');
 
-        if (usagePercent >= threshold && shouldNotify) {
-            checkBandwidthAlerts._last.set(userId, now);
+        if (usagePercent >= threshold) {
             await queueNotification(env, userId, 'bandwidth_alert',
                 `⚠️ هشدار: مصرف حجم ${Math.round(usagePercent)}% رسیده است`);
         }
 
-        // Auto-disable at 100% — cheap only when it actually triggers; guard it so a
-        // D1 write outage can't turn alert bookkeeping into repeated failed writes.
-        if (usagePercent >= 100 && isActive) {
+        // Auto-disable at 100%
+        if (usagePercent >= 100) {
             await env.DB.prepare(
                 'UPDATE users SET is_active = 0 WHERE id = ?'
             ).bind(userId).run();
             clearUUIDCache();
-            invalidateUserCache(uuid);
         }
     } catch (e) {
         console.error('Bandwidth alert error:', e);
@@ -677,8 +503,11 @@ async function mgmtVerifyAuth(request, env) {
         }
     }
 
-    // SECURITY: no alphanumeric fallback — every admin token must exist in DB settings
-    // (the old "token looks valid → grant superadmin" check let anyone bypass auth)
+    // Fallback: If token looks like our generated token (alphanumeric, 16+ chars),
+    // accept it as valid (for cases where DB storage failed or token was truncated)
+    if (token.length >= 16 && /^[A-Za-z0-9]+$/.test(token)) {
+        return { adminId: 0, username: 'admin', role: 'superadmin', expiresAt: new Date(Date.now() + TOKEN_EXPIRY).toISOString() };
+    }
 
     return null;
 }
@@ -877,15 +706,11 @@ async function mgmtDeleteUser(uuid, env) {
     try {
         const user = await env.DB.prepare('SELECT id FROM users WHERE uuid = ?').bind(uuid).first();
         if (user) {
-            // Per-table deletes: a missing table must not abort the user delete
-            const cleanupTables = ['active_connections', 'bandwidth_usage', 'connection_logs', 'notification_queue', 'user_tags'];
-            for (const t of cleanupTables) {
-                try {
-                    await env.DB.prepare(`DELETE FROM ${t} WHERE user_id = ?`).bind(user.id).run();
-                } catch (tblErr) {
-                    console.error(`[DeleteUser] Cleanup ${t} failed: ${tblErr.message}`);
-                }
-            }
+            await env.DB.prepare('DELETE FROM active_connections WHERE user_id = ?').bind(user.id).run();
+            await env.DB.prepare('DELETE FROM bandwidth_usage WHERE user_id = ?').bind(user.id).run();
+            await env.DB.prepare('DELETE FROM connection_logs WHERE user_id = ?').bind(user.id).run();
+            await env.DB.prepare('DELETE FROM notification_queue WHERE user_id = ?').bind(user.id).run();
+            await env.DB.prepare('DELETE FROM user_tags WHERE user_id = ?').bind(user.id).run();
         }
         await env.DB.prepare('DELETE FROM users WHERE uuid = ?').bind(uuid).run();
         clearUUIDCache();
@@ -903,15 +728,11 @@ async function mgmtBulkDeleteUsers(uuids, env) {
         const placeholders = uuids.map(() => '?').join(',');
         const users = await env.DB.prepare(`SELECT id FROM users WHERE uuid IN (${placeholders})`).bind(...uuids).all();
         for (const u of (users.results || [])) {
-            // Per-table deletes: a missing table must not abort the bulk delete
-            const cleanupTables = ['active_connections', 'bandwidth_usage', 'connection_logs', 'notification_queue', 'user_tags'];
-            for (const t of cleanupTables) {
-                try {
-                    await env.DB.prepare(`DELETE FROM ${t} WHERE user_id = ?`).bind(u.id).run();
-                } catch (tblErr) {
-                    console.error(`[BulkDelete] Cleanup ${t} failed: ${tblErr.message}`);
-                }
-            }
+            await env.DB.prepare('DELETE FROM active_connections WHERE user_id = ?').bind(u.id).run();
+            await env.DB.prepare('DELETE FROM bandwidth_usage WHERE user_id = ?').bind(u.id).run();
+            await env.DB.prepare('DELETE FROM connection_logs WHERE user_id = ?').bind(u.id).run();
+            await env.DB.prepare('DELETE FROM notification_queue WHERE user_id = ?').bind(u.id).run();
+            await env.DB.prepare('DELETE FROM user_tags WHERE user_id = ?').bind(u.id).run();
         }
         await env.DB.prepare(`DELETE FROM users WHERE uuid IN (${placeholders})`).bind(...uuids).run();
         clearUUIDCache();
@@ -935,7 +756,6 @@ async function mgmtBulkResetBandwidth(uuids, env) {
             `DELETE FROM bandwidth_usage WHERE user_id IN (SELECT id FROM users WHERE uuid IN (${placeholders}))`
         ).bind(...uuids).run();
 
-        for (const u of uuids) invalidateUserCache(u);
         await auditLog(env, 0, 'bulk_reset_bandwidth', 'user', uuids.join(','), `Reset bandwidth for ${uuids.length} users`);
 
         return mgmtJsonResponse({ success: true, reset: uuids.length });
@@ -1006,7 +826,7 @@ async function mgmtTrackBandwidthAPI(request, env) {
         // Support both new (bytesUp, bytesDown) and legacy (bytes) formats
         const up = bytesUp || bytes || 0;
         const down = bytesDown || 0;
-        await mgmtTrackBandwidth(env, uuid, up, down, { closing: true });
+        await mgmtTrackBandwidth(env, uuid, up, down);
 
         return mgmtJsonResponse({ success: true });
     } catch (e) {
@@ -1138,7 +958,7 @@ async function mgmtGetStats(env) {
         const total = await env.DB.prepare('SELECT COUNT(*) as c FROM users').first();
         const active = await env.DB.prepare('SELECT COUNT(*) as c FROM users WHERE is_active = 1').first();
         const today = await env.DB.prepare(
-            'SELECT SUM(total_bytes) as t FROM bandwidth_usage WHERE date = date("now", "+3 hours", "+30 minutes")'
+            'SELECT SUM(total_bytes) as t FROM bandwidth_usage WHERE date = date("now")'
         ).first();
         const online = await env.DB.prepare('SELECT COUNT(*) as c FROM users WHERE is_online = 1').first();
         const expired = await env.DB.prepare(
@@ -1149,7 +969,7 @@ async function mgmtGetStats(env) {
         const dailyBandwidth = await env.DB.prepare(`
             SELECT date, SUM(total_bytes) as total
             FROM bandwidth_usage
-            WHERE date >= date('now', '+3 hours', '+30 minutes', '-7 days')
+            WHERE date >= date('now', '-7 days')
             GROUP BY date
             ORDER BY date
         `).all();
@@ -1443,16 +1263,14 @@ async function mgmtBulkCreateCleanIPs(request, env) {
         const stmts = [];
         for (let i = 0; i < items.length; i++) {
             const item = items[i];
-            // Name optional — falls back to the IP itself so pasting bare IP lists works
-            const nm = String(item.name || item.ip || '').trim();
-            if (!nm || !item.ip) {
-                errors.push({ index: i, error: 'IP required', item });
+            if (!item.name) {
+                errors.push({ index: i, error: 'Name required', item });
                 continue;
             }
             stmts.push(
                 env.DB.prepare(
                     'INSERT INTO clean_ips (name, ip, port, sni, note, sort_order) VALUES (?, ?, ?, ?, ?, ?)'
-                ).bind(nm, item.ip, item.port || 443, item.sni || '', item.note || '', nextOrder++)
+                ).bind(item.name, item.ip || '', item.port || 443, item.sni || '', item.note || '', nextOrder++)
             );
         }
         if (stmts.length > 0) await env.DB.batch(stmts);
@@ -1620,10 +1438,8 @@ async function mgmtGetSettings(env) {
     try {
         const settings = await env.DB.prepare('SELECT * FROM settings').all();
         const obj = {};
-        // SECURITY: never expose credentials/tokens through the settings API
-        const sensitive = /^auth_token_|password|secret|pswd|admin_password/i;
         for (const s of settings.results) {
-            if (!sensitive.test(s.key)) {
+            if (!s.key.startsWith('auth_token_')) {
                 obj[s.key] = s.value;
             }
         }
@@ -1830,52 +1646,6 @@ async function mgmtHandleRequest(request, env, ctx) {
         });
     }
 
-    // Self-service user panel — same token/uuid auth as /sub.
-    if (path === '/user-panel' || path === '/user-panel/') {
-        const panelToken = url.searchParams.get('token');
-        const panelUuid = url.searchParams.get('uuid');
-        if (!panelToken && !panelUuid) {
-            return new Response(null, { status: 302, headers: { 'Location': '/user-status', ...mgmtCorsHeaders() } });
-        }
-        try {
-            let panelUser = null;
-            if (panelUuid) {
-                panelUser = await env.DB.prepare('SELECT * FROM users WHERE uuid = ? AND is_active = 1').bind(panelUuid).first();
-            } else if (panelToken && env.DB) {
-                const host = url.hostname;
-                const allUsers = await env.DB.prepare('SELECT * FROM users WHERE is_active = 1').all();
-                for (const u of allUsers.results) {
-                    const userToken = await MD5MD5(host + u.uuid);
-                    if (panelToken === userToken) { panelUser = u; break; }
-                }
-            }
-            if (panelUser) {
-                if (panelUser.expires_at && panelUser.expires_at <= currentTimestamp()) {
-                    return mgmtJsonResponse({ error: 'Subscription expired' }, 403);
-                }
-                const host = url.hostname;
-                const subUrl = `https://${host}/sub?token=${await MD5MD5(host + panelUser.uuid)}`;
-                const linkBase = `%PROTO%://${panelUser.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${panelUser.uuid}%3D%3D&sni=%SNI%#ShadowVPN - ${encodeURIComponent(panelUser.username || 'user')}`;
-                const protocols = typeof panelUser.protocols === 'string' ? JSON.parse(panelUser.protocols || '{}') : (panelUser.protocols || {});
-                const pData = await userPanelFetchData(env, panelUser);
-                pData.user = panelUser;
-                pData.host = host;
-                pData.subUrl = subUrl;
-                pData.linkBase = linkBase;
-                pData.protocols = protocols;
-                pData.appLinks = userPanelBuildAppLinks(subUrl);
-                pData.now = currentTimestamp();
-                pData.qrLib = JSON.stringify(QR_LIB);
-                return new Response(userPanelHTML(pData), {
-                    headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store', ...mgmtCorsHeaders() }
-                });
-            }
-        } catch (e) {
-            console.error('[UserPanel] Error:', e.message);
-        }
-        return new Response(null, { status: 302, headers: { 'Location': '/user-status', ...mgmtCorsHeaders() } });
-    }
-
     // Handle subscription endpoint through management system
     if (path === '/sub' || path === '/sub/') {
         const subToken = url.searchParams.get('token');
@@ -1909,30 +1679,6 @@ async function mgmtHandleRequest(request, env, ctx) {
                     // Check bandwidth limit
                     if (user.max_bandwidth_bytes > 0 && user.used_bandwidth_bytes >= user.max_bandwidth_bytes) {
                         return mgmtJsonResponse({ error: 'Bandwidth limit reached' }, 403);
-                    }
-
-                    // Browser opening the sub link directly → show the self-service panel
-                    // instead of a raw config list. Client apps still get their configs
-                    // because they send a non-Mozilla UA (or an explicit fmt/base64 param).
-                    const subUA = (request.headers.get('User-Agent') || '').toLowerCase();
-                    const wantsRaw = url.searchParams.has('fmt') || url.searchParams.has('base64') || url.searchParams.has('b64');
-                    if (subUA.includes('mozilla') && !wantsRaw) {
-                        const host = url.hostname;
-                        const panelSubUrl = `https://${host}/sub?token=${subToken}`;
-                        const linkBase = `%PROTO%://${user.uuid}@%HOST%:%PORT%?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=%SNI%#ShadowVPN - ${encodeURIComponent(user.username || 'user')}`;
-                        const panelProtocols = typeof user.protocols === 'string' ? JSON.parse(user.protocols || '{}') : (user.protocols || {});
-                        const pData = await userPanelFetchData(env, user);
-                        pData.user = user;
-                        pData.host = host;
-                        pData.subUrl = panelSubUrl;
-                        pData.linkBase = linkBase;
-                        pData.protocols = panelProtocols;
-                        pData.appLinks = userPanelBuildAppLinks(panelSubUrl);
-                        pData.now = currentTimestamp();
-                        pData.qrLib = JSON.stringify(QR_LIB);
-                        return new Response(userPanelHTML(pData), {
-                            headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store', ...mgmtCorsHeaders() }
-                        });
                     }
 
                     // Generate subscription configs based on user's protocols
@@ -1977,51 +1723,41 @@ async function mgmtHandleRequest(request, env, ctx) {
                     const antiDpiParams = "&fp=unsafe&cs=TLS_AES_256_GCM_SHA384%3ATLS_CHACHA20_POLY1305_SHA256%3ATLS_AES_128_GCM_SHA256%3ATLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384%3ATLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384%3ATLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256%3ATLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256%3ATLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256%3ATLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_RSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256&fm=%7B%22tcp%22%3A%20%5B%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22packets%22%3A%20%22tlshello%22%2C%20%22lengths%22%3A%20%5B%225%22%2C%20%2294%22%2C%20%221%22%5D%2C%20%22delays%22%3A%20%5B%220%22%5D%2C%20%22maxSplit%22%3A%20%220%22%7D%7D%2C%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22packets%22%3A%20%221-1%22%2C%20%22lengths%22%3A%20%5B%22109%22%2C%20%221%22%5D%2C%20%22delays%22%3A%20%5B%221%22%5D%2C%20%22maxSplit%22%3A%20%22355%22%7D%7D%5D%7D";
 
                     // ===== NORMAL CONFIGS (always generated, NO antiDpiParams) =====
-                    // SECURITY: never emit the worker DOMAIN as connect address — users
-                    // connect via clean IPs only (the domain still rides inside TLS as SNI).
-                    // Load clean IPs; if none are configured, fall back to domain-443 once
-                    // so the subscription is never empty.
-                    // Clean IPs — the ONLY connect addresses emitted (domain stays in SNI)
-                    let activeCleanIPs = [];
+                    // Default host - Normal configs (all 3 ports)
+                    for (const port of defaultPorts) {
+                        if (protocols.vless !== false) {
+                            configs.push(`vless://${user.uuid}@${host}:${port}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - ${port})`);
+                        }
+                        if (protocols.trojan !== false) {
+                            configs.push(`trojan://${user.uuid}@${host}:${port}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - ${port})`);
+                        }
+                    }
+                    // Clean IPs - Normal configs (no port in remark, use c.name)
                     try {
                         const cleanResult = await env.DB.prepare('SELECT * FROM clean_ips WHERE is_active = 1 ORDER BY sort_order ASC, id ASC').all();
-                        activeCleanIPs = cleanResult.results || [];
-                    } catch (_) { activeCleanIPs = []; }
-                    for (const c of activeCleanIPs) {
-                        const cHost = c.ip || host;
-                        const cPort = c.port || 443;
-                        const cSni = c.sni || host;
-                        if (protocols.vless !== false) {
-                            configs.push(`vless://${user.uuid}@${cHost}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
+                        const cleanIPs = cleanResult.results || [];
+                        for (const c of cleanIPs) {
+                            const cHost = c.ip || host;
+                            const cPort = c.port || 443;
+                            const cSni = c.sni || host;
+                            if (protocols.vless !== false) {
+                                configs.push(`vless://${user.uuid}@${cHost}:${cPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
+                            }
+                            if (protocols.trojan !== false) {
+                                configs.push(`trojan://${user.uuid}@${cHost}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
+                            }
                         }
-                        if (protocols.trojan !== false) {
-                            configs.push(`trojan://${user.uuid}@${cHost}:${cPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${cSni}#ShadowVPN 🛡️ - ${user.username || 'user'} (${c.name})`);
-                        }
-                    }
-                    // Fallback: no clean IPs configured at all → one domain-443 entry so
-                    // the sub is never empty (operator should configure clean IPs).
-                    if (activeCleanIPs.length === 0) {
-                        if (protocols.vless !== false) {
-                            configs.push(`vless://${user.uuid}@${host}:443?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443)`);
-                        }
-                        if (protocols.trojan !== false) {
-                            configs.push(`trojan://${user.uuid}@${host}:443?security=tls&type=ws&path=%2F${user.uuid}%3D%3D#ShadowVPN 🛡️ - ${user.username || 'user'} (Normal - 443)`);
-                        }
-                    }
+                    } catch (_) { /* ignore clean IP errors */ }
 
                     // ===== ANTI-FILTER CONFIGS (only if toggle enabled, WITH antiDpiParams) =====
                     if (protocols.anti_filter === true) {
-                        // Anti-Filter via the FIRST active clean IP (never the bare domain)
-                        const antiClean = activeCleanIPs[0];
-                        if (antiClean) {
-                            const aHost = antiClean.ip || host;
-                            const aPort = antiClean.port || 443;
-                            const aSni = antiClean.sni || host;
+                        const antiFilterPorts = ['443', '2053'];
+                        for (const port of antiFilterPorts) {
                             if (protocols.vless !== false) {
-                                configs.push(`vless://${user.uuid}@${aHost}:${aPort}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${aSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Anti-Filter - ${aPort})🚀`);
+                                configs.push(`vless://${user.uuid}@${host}:${port}?encryption=none&security=tls&type=ws&path=%2F${user.uuid}%3D%3D${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Anti-Filter - ${port})🚀`);
                             }
                             if (protocols.trojan !== false) {
-                                configs.push(`trojan://${user.uuid}@${aHost}:${aPort}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D&sni=${aSni}${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Anti-Filter - ${aPort})🚀`);
+                                configs.push(`trojan://${user.uuid}@${host}:${port}?security=tls&type=ws&path=%2F${user.uuid}%3D%3D${antiDpiParams}#ShadowVPN 🛡️ - ${user.username || 'user'} (Anti-Filter - ${port})🚀`);
                             }
                         }
                     }
@@ -2042,15 +1778,7 @@ async function mgmtHandleRequest(request, env, ctx) {
             }
         }
 
-        // If no token or user not found, redirect to status page — EXCEPT when the
-        // presented token is the env-UUID's proxy-core subscription token
-        // (MD5MD5(host + envUUID)). On a zero-user deployment the env UUID is the
-        // intended credential, and its /sub handler lives in the proxy core.
-        const fallthroughToken = url.searchParams.get('token');
-        if (fallthroughToken && env.UUID) {
-            const envSubToken = await MD5MD5(url.hostname + env.UUID);
-            if (fallthroughToken === envSubToken) return null; // fall through to proxy-core /sub
-        }
+        // If no token or user not found, redirect to status page
         return new Response(null, {
             status: 302,
             headers: { 'Location': '/user-status', ...mgmtCorsHeaders() }
@@ -2230,255 +1958,144 @@ function mgmtAdminHTML() {
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         :root {
-            --bg-primary: #0a0e1a;
-            --bg-secondary: rgba(17, 24, 39, 0.72);
-            --bg-tertiary: rgba(31, 41, 55, 0.6);
-            --bg-solid: #111827;
-            --text-primary: #f1f5f9;
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-tertiary: #334155;
+            --text-primary: #e2e8f0;
             --text-secondary: #94a3b8;
-            --text-dim: #64748b;
-            --accent: #38bdf8;
-            --accent-2: #818cf8;
-            --accent-hover: #0ea5e9;
-            --success: #34d399;
-            --warning: #fbbf24;
-            --danger: #f87171;
-            --border: rgba(148, 163, 184, 0.14);
-            --border-strong: rgba(148, 163, 184, 0.28);
-            --glass: rgba(17, 24, 39, 0.66);
-            --radius: 14px;
-            --radius-sm: 9px;
-            --shadow: 0 10px 40px -12px rgba(0, 0, 0, 0.55);
-            --glow-accent: 0 0 24px -6px rgba(56, 189, 248, 0.45);
-            --font: 'Segoe UI', Tahoma, sans-serif;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --border: #334155;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        html { scrollbar-color: rgba(148,163,184,0.3) transparent; }
-        ::-webkit-scrollbar { width: 9px; height: 9px; }
-        ::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.25); border-radius: 8px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(148,163,184,0.45); }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::selection { background: rgba(56,189,248,0.32); }
-        body {
-            font-family: var(--font); color: var(--text-primary); min-height: 100vh;
-            background:
-                radial-gradient(1100px 520px at 82% -8%, rgba(56,189,248,0.13), transparent 62%),
-                radial-gradient(950px 480px at 12% 108%, rgba(129,140,248,0.12), transparent 60%),
-                linear-gradient(160deg, #0a0e1a 0%, #0d1226 48%, #0a0e1a 100%);
-            background-attachment: fixed;
-        }
-        body::before {
-            content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0; opacity: 0.5;
-            background-image: linear-gradient(rgba(148,163,184,0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,0.045) 1px, transparent 1px);
-            background-size: 44px 44px;
-            -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 30%, #000 30%, transparent 78%);
-            mask-image: radial-gradient(ellipse 90% 70% at 50% 30%, #000 30%, transparent 78%);
-        }
-        @keyframes floatUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes spinOnce { to { transform: rotate(360deg); } }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: linear-gradient(135deg, #0f172a, #1e1b4b, #0f172a); background-size: 200% 200%; animation: gradientBG 15s ease infinite; color: var(--text-primary); min-height: 100vh; }
+@keyframes gradientBG { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+.login-form, .panel, .stat, .modal-content, .header, .nav { background: rgba(30, 41, 59, 0.4) !important; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1) !important; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); }
 
-        /* ---------- Glass cards ---------- */
-        .login-form, .panel, .stat, .modal-content, .header, .nav {
-            background: var(--glass) !important;
-            backdrop-filter: blur(18px) saturate(1.25);
-            -webkit-backdrop-filter: blur(18px) saturate(1.25);
-            border: 1px solid var(--border) !important;
-            box-shadow: var(--shadow);
-        }
+        /* Login */
+        .login-box { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .login-form { background: var(--bg-secondary); padding: 2rem; border-radius: 1rem; width: 100%; max-width: 400px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+        .login-form h1 { text-align: center; color: var(--accent); margin-bottom: 1.5rem; font-size: 1.5rem; }
+        .login-form input { width: 100%; padding: 0.75rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: 0.5rem; background: var(--bg-primary); color: var(--text-primary); font-size: 1rem; }
+        .login-form button { width: 100%; padding: 0.75rem; background: var(--accent); color: white; border: none; border-radius: 0.5rem; cursor: pointer; font-size: 1rem; font-weight: 600; }
+        .login-form button:hover { background: var(--accent-hover); }
 
-        /* ---------- Login ---------- */
-        .login-box { display: flex; justify-content: center; align-items: center; min-height: 100vh; position: relative; z-index: 1; }
-        .login-form { background: var(--glass); padding: 2.4rem 2.2rem; border-radius: 20px; width: 100%; max-width: 400px; box-shadow: var(--shadow), var(--glow-accent); animation: floatUp 0.5s ease both; }
-        .login-form h1 { text-align: center; margin-bottom: 1.7rem; font-size: 1.45rem; font-weight: 700; letter-spacing: 0.3px; background: linear-gradient(120deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
-        .login-form input { width: 100%; padding: 0.8rem 1rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: rgba(10, 14, 26, 0.7); color: var(--text-primary); font-size: 0.95rem; transition: border-color 0.2s, box-shadow 0.2s; }
-        .login-form input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.16); }
-        .login-form input::placeholder { color: var(--text-dim); }
-        .login-form button { width: 100%; padding: 0.8rem; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #071018; border: none; border-radius: var(--radius-sm); cursor: pointer; font-size: 1rem; font-weight: 700; transition: transform 0.15s, box-shadow 0.2s, filter 0.2s; box-shadow: var(--glow-accent); }
-        .login-form button:hover { transform: translateY(-1px); filter: brightness(1.08); box-shadow: 0 0 32px -6px rgba(56,189,248,0.6); }
-        .login-form button:active { transform: translateY(0); }
-
-        /* ---------- Header ---------- */
-        .header { position: sticky; top: 0; z-index: 50; padding: 0.85rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); border-radius: 0 !important; }
-        .header h1 { font-size: 1.15rem; font-weight: 700; background: linear-gradient(120deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+        /* Header */
+        .header { background: var(--bg-secondary); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
+        .header h1 { color: var(--accent); font-size: 1.25rem; }
         .header-actions { display: flex; gap: 0.5rem; }
 
-        /* ---------- Nav ---------- */
-        .nav { position: sticky; top: 57px; z-index: 49; padding: 0.5rem 1.5rem; display: flex; gap: 0.35rem; border-bottom: 1px solid var(--border); border-radius: 0 !important; overflow-x: auto; }
-        .nav-item { display: inline-flex; align-items: center; gap: 0.45rem; padding: 0.5rem 0.95rem; border-radius: 10px; cursor: pointer; color: var(--text-secondary); font-size: 0.88rem; font-weight: 600; white-space: nowrap; transition: color 0.2s, background 0.2s, box-shadow 0.2s; border: 1px solid transparent; }
+        /* Navigation */
+        .nav { background: var(--bg-secondary); padding: 0.5rem 2rem; display: flex; gap: 0.5rem; border-bottom: 1px solid var(--border); overflow-x: auto; }
+        .nav-item { padding: 0.5rem 1rem; border-radius: 0.375rem; cursor: pointer; color: var(--text-secondary); transition: all 0.2s; white-space: nowrap; }
         .nav-item:hover { background: var(--bg-tertiary); color: var(--text-primary); }
-        .nav-item.active { background: linear-gradient(135deg, rgba(56,189,248,0.16), rgba(129,140,248,0.16)); color: var(--accent); border-color: rgba(56,189,248,0.35); box-shadow: inset 0 0 18px -10px rgba(56,189,248,0.5); }
-        .nav-item .icon { width: 1.12em; height: 1.12em; }
+        .nav-item.active { background: var(--accent); color: white; }
 
-        /* ---------- Container & sections ---------- */
-        .container { padding: 1.8rem 2rem 3rem; max-width: 1380px; margin: 0 auto; position: relative; z-index: 1; }
-        .section { animation: floatUp 0.35s ease both; }
+        /* Container */
+        .container { padding: 2rem; max-width: 1400px; margin: 0 auto; }
 
-        /* ---------- Cards / panels ---------- */
-        .panel, .chart-container { background: var(--glass); backdrop-filter: blur(18px) saturate(1.25); -webkit-backdrop-filter: blur(18px) saturate(1.25); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
-        .chart-container { padding: 1.4rem; margin-bottom: 1.4rem; }
-        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
-        .chart-header h3 { color: var(--text-secondary); font-weight: 600; }
+        /* Stats */
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+        .stat { background: var(--bg-secondary); padding: 1.25rem; border-radius: 0.75rem; border: 1px solid var(--border); }
+        .stat h3 { color: var(--text-secondary); font-size: 0.8rem; margin-bottom: 0.5rem; }
+        .stat .val { font-size: 1.5rem; font-weight: bold; color: var(--accent); }
+        .stat .val.success { color: var(--success); }
+        .stat .val.warning { color: var(--warning); }
+        .stat .val.danger { color: var(--danger); }
 
-        /* ---------- Stats ---------- */
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.9rem; margin-bottom: 1.8rem; }
-        .stat { position: relative; overflow: hidden; padding: 1.15rem 1.2rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--glass); backdrop-filter: blur(18px) saturate(1.25); -webkit-backdrop-filter: blur(18px) saturate(1.25); box-shadow: var(--shadow); transition: transform 0.2s, border-color 0.25s, box-shadow 0.25s; }
-        .stat:hover { transform: translateY(-3px); border-color: var(--border-strong); box-shadow: var(--shadow), 0 0 22px -10px rgba(56,189,248,0.4); }
-        .stat::after { content: ''; position: absolute; inset-inline-start: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(180deg, var(--accent), transparent); opacity: 0.75; }
-        .stat h3 { color: var(--text-secondary); font-size: 0.78rem; margin-bottom: 0.55rem; font-weight: 600; display: flex; align-items: center; gap: 0.4rem; }
-        .stat .val { font-size: 1.55rem; font-weight: 800; color: var(--accent); font-variant-numeric: tabular-nums; text-shadow: 0 0 18px rgba(56,189,248,0.35); }
-        .stat .val.success { color: var(--success); text-shadow: 0 0 18px rgba(52,211,153,0.3); }
-        .stat .val.warning { color: var(--warning); text-shadow: 0 0 18px rgba(251,191,36,0.3); }
-        .stat .val.danger { color: var(--danger); text-shadow: 0 0 18px rgba(248,113,113,0.3); }
+        /* Buttons */
+        .btn { padding: 0.6rem 1.2rem; border: 1px solid rgba(255,255,255,0.1); border-radius: 0.5rem; cursor: pointer; font-size: 0.9rem; font-weight: 600; margin: 0.25rem; transition: all 0.2s; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+        .btn-primary { background: linear-gradient(135deg, rgba(59,130,246,0.8), rgba(37,99,235,0.9)); color: white; box-shadow: 0 0 15px rgba(59,130,246,0.4); }
+        .btn-primary:hover { background: linear-gradient(135deg, rgba(59,130,246,1), rgba(37,99,235,1)); box-shadow: 0 0 25px rgba(59,130,246,0.6); }
+        .btn-success { background: linear-gradient(135deg, rgba(16,185,129,0.8), rgba(5,150,105,0.9)); color: white; box-shadow: 0 0 15px rgba(16,185,129,0.4); }
+        .btn-success:hover { background: linear-gradient(135deg, rgba(16,185,129,1), rgba(5,150,105,1)); box-shadow: 0 0 25px rgba(16,185,129,0.6); }
+        .btn-danger { background: linear-gradient(135deg, rgba(239,68,68,0.8), rgba(220,38,38,0.9)); color: white; box-shadow: 0 0 15px rgba(239,68,68,0.4); }
+        .btn-danger:hover { background: linear-gradient(135deg, rgba(239,68,68,1), rgba(220,38,38,1)); box-shadow: 0 0 25px rgba(239,68,68,0.6); }
+        .btn-warning { background: linear-gradient(135deg, rgba(245,158,11,0.8), rgba(217,119,6,0.9)); color: white; box-shadow: 0 0 15px rgba(245,158,11,0.4); }
+        .btn-warning:hover { background: linear-gradient(135deg, rgba(245,158,11,1), rgba(217,119,6,1)); box-shadow: 0 0 25px rgba(245,158,11,0.6); }
+        .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+        .btn-outline { background: transparent !important; border: 1px solid var(--border) !important; color: var(--text-primary); }
 
-        /* ---------- Buttons ---------- */
-        .btn { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.15rem; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; font-size: 0.88rem; font-weight: 600; margin: 0.2rem; color: var(--text-primary); background: var(--bg-tertiary); transition: transform 0.15s, box-shadow 0.2s, filter 0.2s, background 0.2s; }
-        .btn:hover { transform: translateY(-1px); }
-        .btn:active { transform: translateY(0); }
-        .btn-primary { background: linear-gradient(135deg, rgba(56,189,248,0.9), rgba(129,140,248,0.9)); color: #071018; border: none; box-shadow: var(--glow-accent); }
-        .btn-primary:hover { filter: brightness(1.1); box-shadow: 0 0 30px -6px rgba(56,189,248,0.65); }
-        .btn-success { background: linear-gradient(135deg, rgba(52,211,153,0.85), rgba(16,185,129,0.9)); color: #06251a; border: none; box-shadow: 0 0 24px -8px rgba(52,211,153,0.55); }
-        .btn-success:hover { filter: brightness(1.1); }
-        .btn-danger { background: linear-gradient(135deg, rgba(248,113,113,0.85), rgba(220,38,38,0.9)); color: #fff; border: none; box-shadow: 0 0 24px -8px rgba(248,113,113,0.5); }
-        .btn-danger:hover { filter: brightness(1.1); }
-        .btn-warning { background: linear-gradient(135deg, rgba(251,191,36,0.85), rgba(217,119,6,0.9)); color: #241703; border: none; box-shadow: 0 0 24px -8px rgba(251,191,36,0.5); }
-        .btn-warning:hover { filter: brightness(1.1); }
-        .btn-sm { padding: 0.32rem 0.6rem; font-size: 0.76rem; border-radius: 8px; }
-        .btn-outline { background: transparent !important; border: 1px solid var(--border-strong) !important; color: var(--text-primary); }
-        .btn-outline:hover { border-color: var(--accent) !important; color: var(--accent); }
-
-        /* ---------- Table ---------- */
-        .table-container { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--border); background: var(--glass); backdrop-filter: blur(18px) saturate(1.25); -webkit-backdrop-filter: blur(18px) saturate(1.25); box-shadow: var(--shadow); }
+        /* Table */
+        .table-container { overflow-x: auto; border-radius: 0.75rem; border: 1px solid var(--border); }
         table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 0.78rem 0.9rem; text-align: right; border-bottom: 1px solid var(--border); }
-        th { background: rgba(10, 14, 26, 0.6); color: var(--text-secondary); font-weight: 700; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; position: sticky; top: 0; }
-        tr { transition: background 0.15s; }
-        tbody tr:hover { background: rgba(56,189,248,0.055); }
-        tbody tr:last-child td { border-bottom: none; }
-        .uuid-copy { font-family: ui-monospace, monospace; font-size: 0.74rem; word-break: break-all; max-width: 200px; }
+        th, td { padding: 0.75rem; text-align: right; border-bottom: 1px solid var(--border); }
+        th { background: var(--bg-primary); color: var(--text-secondary); font-weight: 600; font-size: 0.8rem; }
+        tr:hover { background: var(--bg-tertiary); }
+        .uuid-copy { font-family: monospace; font-size: 0.75rem; word-break: break-all; max-width: 200px; }
 
-        /* ---------- Forms ---------- */
+        /* Forms */
         .form-group { margin-bottom: 1rem; }
-        .form-group label { display: block; margin-bottom: 0.5rem; color: var(--text-secondary); font-size: 0.83rem; font-weight: 600; }
-        .form-group input, .form-group select, .form-group textarea, .search-box input, .toolbar select {
-            width: 100%; padding: 0.7rem 0.9rem; border: 1px solid var(--border); border-radius: var(--radius-sm);
-            background: rgba(10, 14, 26, 0.7); color: var(--text-primary); font-size: 0.92rem; transition: border-color 0.2s, box-shadow 0.2s;
-        }
-        .form-group input:focus, .form-group select:focus, .form-group textarea:focus, .search-box input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.16); }
-        .form-group input::placeholder, .search-box input::placeholder { color: var(--text-dim); }
+        .form-group label { display: block; margin-bottom: 0.5rem; color: var(--text-secondary); font-size: 0.875rem; }
+        .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 0.75rem; border: 1px solid var(--border); border-radius: 0.5rem; background: var(--bg-primary); color: var(--text-primary); }
         .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-        select option { background: var(--bg-solid); color: var(--text-primary); }
 
-        /* ---------- Modal ---------- */
-        .modal { display: none; position: fixed; inset: 0; background: rgba(4, 8, 16, 0.72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); z-index: 1000; justify-content: center; align-items: center; padding: 1rem; }
+        /* Modal */
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; justify-content: center; align-items: center; }
         .modal.active { display: flex; }
-        .modal-content { background: var(--glass) !important; backdrop-filter: blur(24px) saturate(1.3); -webkit-backdrop-filter: blur(24px) saturate(1.3); padding: 1.8rem; border-radius: 18px; width: 100%; max-width: 600px; max-height: 90vh; overflow-y: auto; border: 1px solid var(--border-strong) !important; box-shadow: var(--shadow), var(--glow-accent); animation: floatUp 0.28s ease both; }
-        .modal-content h2 { margin-bottom: 1.4rem; font-size: 1.15rem; font-weight: 700; background: linear-gradient(120deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+        .modal-content { background: var(--bg-secondary); padding: 2rem; border-radius: 1rem; width: 100%; max-width: 600px; max-height: 90vh; overflow-y: auto; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+        .modal-content h2 { margin-bottom: 1.5rem; color: var(--accent); }
 
-        /* ---------- Toolbar ---------- */
-        .toolbar { display: flex; gap: 0.7rem; margin-bottom: 1.1rem; flex-wrap: wrap; align-items: center; }
-        .toolbar select { width: auto; min-width: 140px; cursor: pointer; }
-        .search-box { flex: 1; min-width: 210px; }
+        /* Search & Filter */
+        .toolbar { display: flex; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; align-items: center; }
+        .search-box { flex: 1; min-width: 200px; }
+        .search-box input { width: 100%; padding: 0.5rem 1rem; border: 1px solid var(--border); border-radius: 0.5rem; background: var(--bg-primary); color: var(--text-primary); }
 
-        /* ---------- Badges & tags ---------- */
-        .badge { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.28rem 0.6rem; border-radius: 999px; font-size: 0.72rem; font-weight: 700; }
-        .badge-success { background: rgba(52,211,153,0.14); color: var(--success); border: 1px solid rgba(52,211,153,0.35); }
-        .badge-danger { background: rgba(248,113,113,0.14); color: var(--danger); border: 1px solid rgba(248,113,113,0.35); }
-        .badge-warning { background: rgba(251,191,36,0.14); color: var(--warning); border: 1px solid rgba(251,191,36,0.35); }
-        .tag { display: inline-block; padding: 0.14rem 0.55rem; border-radius: 999px; font-size: 0.7rem; margin: 0.14rem; background: rgba(56,189,248,0.14); color: var(--accent); border: 1px solid rgba(56,189,248,0.35); }
+        /* Status badges */
+        .badge { padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 600; }
+        .badge-success { background: rgba(16,185,129,0.2); color: var(--success); }
+        .badge-danger { background: rgba(239,68,68,0.2); color: var(--danger); }
+        .badge-warning { background: rgba(245,158,11,0.2); color: var(--warning); }
 
-        /* ---------- Progress ---------- */
-        .progress { height: 7px; background: rgba(148,163,184,0.14); border-radius: 999px; overflow: hidden; }
-        .progress-bar { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.35s ease; box-shadow: 0 0 10px -2px rgba(56,189,248,0.7); }
-        .progress-bar.warning { background: linear-gradient(90deg, #fbbf24, #f59e0b); box-shadow: 0 0 10px -2px rgba(251,191,36,0.7); }
-        .progress-bar.danger { background: linear-gradient(90deg, #f87171, #ef4444); box-shadow: 0 0 10px -2px rgba(248,113,113,0.7); }
+        /* Progress bar */
+        .progress { height: 8px; background: var(--bg-tertiary); border-radius: 4px; overflow: hidden; }
+        .progress-bar { height: 100%; background: var(--accent); transition: width 0.3s; }
+        .progress-bar.warning { background: var(--warning); }
+        .progress-bar.danger { background: var(--danger); }
 
-        /* ---------- Tabs & pagination ---------- */
-        .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
-        .tab { padding: 0.5rem 1rem; cursor: pointer; color: var(--text-secondary); border-radius: 10px 10px 0 0; transition: color 0.2s; font-weight: 600; font-size: 0.9rem; }
-        .tab:hover { color: var(--text-primary); }
-        .tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
-        .pagination { display: flex; justify-content: center; gap: 0.5rem; margin-top: 1.1rem; }
-        .page-btn { padding: 0.45rem 0.95rem; border: 1px solid var(--border); border-radius: 9px; cursor: pointer; background: var(--bg-tertiary); color: var(--text-primary); transition: border-color 0.2s, background 0.2s; }
-        .page-btn:hover { border-color: var(--accent); }
-        .page-btn.active { background: linear-gradient(135deg, rgba(56,189,248,0.25), rgba(129,140,248,0.25)); color: var(--accent); border-color: rgba(56,189,248,0.45); }
-        .page-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        /* Chart container */
+        .chart-container { background: var(--bg-secondary); padding: 1.5rem; border-radius: 0.75rem; border: 1px solid var(--border); margin-bottom: 1.5rem; }
+        .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+        .chart-header h3 { color: var(--text-secondary); }
 
-        /* ---------- Connection info ---------- */
+        /* Config modal */
         .config-modal { max-width: 800px; }
-        .config-box { background: rgba(10, 14, 26, 0.8); padding: 1rem; border-radius: var(--radius-sm); font-family: ui-monospace, monospace; font-size: 0.78rem; word-break: break-all; margin-bottom: 1rem; border: 1px solid var(--border); color: #a5f3fc; }
-        .connection-info { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.9rem; margin-bottom: 1.4rem; }
-        .connection-info div { background: rgba(10, 14, 26, 0.7); padding: 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border); text-align: center; transition: border-color 0.25s, box-shadow 0.25s; }
-        .connection-info div:hover { border-color: var(--border-strong); box-shadow: var(--glow-accent); }
-        .connection-info h4 { color: var(--text-secondary); font-size: 0.72rem; margin-bottom: 0.5rem; font-weight: 600; }
-        .connection-info .value { color: var(--accent); font-weight: 800; font-size: 1.2rem; font-variant-numeric: tabular-nums; }
+        .config-box { background: var(--bg-primary); padding: 1rem; border-radius: 0.5rem; font-family: monospace; font-size: 0.8rem; word-break: break-all; margin-bottom: 1rem; border: 1px solid var(--border); }
+        .connection-info { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 1.5rem; }
+        .connection-info div { background: var(--bg-primary); padding: 1rem; border-radius: 0.5rem; border: 1px solid var(--border); text-align: center; }
+        .connection-info h4 { color: var(--text-secondary); font-size: 0.75rem; margin-bottom: 0.5rem; }
+        .connection-info .value { color: var(--accent); font-weight: bold; font-size: 1.25rem; }
 
-        /* ---------- SVG icon system ---------- */
-        .icon { width: 1.05em; height: 1.05em; vertical-align: -0.18em; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
-        .icon.filled { fill: currentColor; stroke: none; }
-        .btn .icon, .nav-item .icon { opacity: 0.92; }
-        .login-form h1 { display: flex; align-items: center; justify-content: center; gap: 0.55rem; }
-        .login-form h1 .logo { width: 1.75em; height: 1.75em; -webkit-text-fill-color: initial; }
-        .header h1 { display: flex; align-items: center; gap: 0.55rem; }
-        .header h1 .logo { width: 1.55em; height: 1.55em; -webkit-text-fill-color: initial; }
-        .logo-gradient { animation: logoGlow 3.2s ease-in-out infinite; }
-        @keyframes logoGlow { 0%,100% { filter: drop-shadow(0 0 3px rgba(56,189,248,0.4)); } 50% { filter: drop-shadow(0 0 10px rgba(56,189,248,0.75)); } }
+        /* Tabs */
+        .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+        .tab { padding: 0.5rem 1rem; cursor: pointer; color: var(--text-secondary); border-radius: 0.375rem 0.375rem 0 0; }
+        .tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
 
-        /* ---------- Section headers ---------- */
-        h3[style*="display:flex"] { font-weight: 700; letter-spacing: 0.2px; }
+        /* Pagination */
+        .pagination { display: flex; justify-content: center; gap: 0.5rem; margin-top: 1rem; }
+        .page-btn { padding: 0.5rem 1rem; border: 1px solid var(--border); border-radius: 0.375rem; cursor: pointer; background: var(--bg-secondary); color: var(--text-primary); }
+        .page-btn.active { background: var(--accent); color: white; }
+        .page-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-        /* ---------- Responsive ---------- */
+        /* Responsive */
         @media (max-width: 768px) {
-            .container { padding: 1rem 0.9rem 2.4rem; }
+            .container { padding: 1rem; }
             .stats { grid-template-columns: 1fr 1fr; }
             .form-row { grid-template-columns: 1fr; }
             .connection-info { grid-template-columns: 1fr; }
-            .header { padding: 0.75rem 1rem; }
-            .nav { top: 53px; padding: 0.5rem 0.75rem; }
         }
+
+        /* Tags */
+        .tag { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; margin: 0.125rem; background: var(--accent); color: white; }
     </style>
 </head>
 <body>
-    <!-- SVG sprite: all panel icons, referenced via <use href="#i-name"> -->
-    <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
-        <defs>
-            <linearGradient id="shieldGrad" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0%" stop-color="#60a5fa"/><stop offset="100%" stop-color="#2563eb"/>
-            </linearGradient>
-        </defs>
-        <symbol id="i-logo" viewBox="0 0 24 24">
-            <path d="M12 2 L20 5.5 V11 C20 16.5 16.6 20.6 12 22 C7.4 20.6 4 16.5 4 11 V5.5 Z" fill="url(#shieldGrad)" stroke="none" opacity="0.95"/>
-            <path d="M8.6 11.6 L11 14 L15.6 8.6" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-        </symbol>
-        <symbol id="i-dashboard" viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 15v-4"/><path d="M12 15V7"/><path d="M17 15v-6"/></symbol>
-        <symbol id="i-users" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/><circle cx="10" cy="7" r="3.4"/><path d="M21 21v-2a4 4 0 0 0-3-3.85"/><path d="M15.5 3.6a3.4 3.4 0 0 1 0 6.6"/></symbol>
-        <symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8.2 12 3 3 8.2v7.6L12 21l9-5.2Z"/><path d="M3 8.2 12 13.4l9-5.2"/><path d="M12 13.4V21"/></symbol>
-        <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07L11.5 4.4"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.47"/></symbol>
-        <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3.5 6h.01"/><path d="M3.5 12h.01"/><path d="M3.5 18h.01"/></symbol>
-        <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14.5 14.5 0 0 1 0 18a14.5 14.5 0 0 1 0-18"/></symbol>
-        <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></symbol>
-        <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></symbol>
-        <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></symbol>
-        <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></symbol>
-        <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></symbol>
-        <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
-        <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12Z"/></symbol>
-        <symbol id="i-edit" viewBox="0 0 24 24"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="M15 5l4 4"/></symbol>
-        <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
-        <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
-        <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
-        <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></symbol>
-        <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
-        <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7" fill="currentColor" stroke="none"/></symbol>
-        <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></symbol>
-        <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
-        <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.8 12.2 9.7-9.7"/><path d="m15 8 3 3"/><path d="m18 5 3 3"/></symbol>
-        <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 20 5.5 V11 C20 16.5 16.6 20.6 12 22 C7.4 20.6 4 16.5 4 11 V5.5 Z"/></symbol>
-        <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
-    </svg>
-
     <div id="loginPage" class="login-box">
         <div class="login-form">
-            <h1><svg class="icon logo logo-gradient" style="stroke:none"><use href="#i-logo"/></svg>Edge Manager</h1>
+            <h1>🔐 Edge Manager</h1>
             <input type="text" id="loginUsername" placeholder="نام کاربری" value="admin">
             <input type="password" id="loginPassword" placeholder="رمز عبور" onkeypress="if(event.key==='Enter')doLogin()">
             <button onclick="doLogin()">ورود</button>
@@ -2487,20 +2104,20 @@ function mgmtAdminHTML() {
 
     <div id="dashboard" style="display:none">
         <div class="header">
-            <h1><svg class="icon logo logo-gradient" style="stroke:none"><use href="#i-logo"/></svg>Edge Manager</h1>
+            <h1>⚡ Edge Manager</h1>
             <div class="header-actions">
-                <button class="btn btn-outline btn-sm" onclick="refreshAll(this)"><svg class="icon"><use href="#i-refresh"/></svg>بروزرسانی</button>
-                <button class="btn btn-danger btn-sm" onclick="doLogout()"><svg class="icon"><use href="#i-logout"/></svg>خروج</button>
+                <button class="btn btn-outline btn-sm" onclick="refreshAll(this)">🔄 بروزرسانی</button>
+                <button class="btn btn-danger btn-sm" onclick="doLogout()">خروج</button>
             </div>
         </div>
         <div class="nav">
-            <div class="nav-item active" onclick="showSection('dashboard-section', this)"><svg class="icon"><use href="#i-dashboard"/></svg>داشبورد</div>
-            <div class="nav-item" onclick="showSection('users-section', this)"><svg class="icon"><use href="#i-users"/></svg>کاربران</div>
-            <div class="nav-item" onclick="showSection('plans-section', this)"><svg class="icon"><use href="#i-box"/></svg>پلن‌ها</div>
-            <div class="nav-item" onclick="showSection('connections-section', this)"><svg class="icon"><use href="#i-link"/></svg>اتصالات</div>
-            <div class="nav-item" onclick="showSection('logs-section', this)"><svg class="icon"><use href="#i-list"/></svg>لاگ‌ها</div>
-            <div class="nav-item" onclick="showSection('cleanips-section', this)"><svg class="icon"><use href="#i-globe"/></svg>Clean IP ها</div>
-            <div class="nav-item" onclick="showSection('settings-section', this)"><svg class="icon"><use href="#i-gear"/></svg>تنظیمات</div>
+            <div class="nav-item active" onclick="showSection('dashboard-section', this)">📊 داشبورد</div>
+            <div class="nav-item" onclick="showSection('users-section', this)">👥 کاربران</div>
+            <div class="nav-item" onclick="showSection('plans-section', this)">📦 پلن‌ها</div>
+            <div class="nav-item" onclick="showSection('connections-section', this)">🔗 اتصالات</div>
+            <div class="nav-item" onclick="showSection('logs-section', this)">📋 لاگ‌ها</div>
+            <div class="nav-item" onclick="showSection('cleanips-section', this)">🌐 Clean IP ها</div>
+            <div class="nav-item" onclick="showSection('settings-section', this)">⚙️ تنظیمات</div>
         </div>
 
         <div class="container">
@@ -2533,10 +2150,10 @@ function mgmtAdminHTML() {
                     <select id="planFilter" onchange="loadUsers()">
                         <option value="">همه پلن‌ها</option>
                     </select>
-                    <button class="btn btn-primary" onclick="showCreateModal()"><svg class="icon"><use href="#i-plus"/></svg>کاربر جدید</button>
-                    <button class="btn btn-success" onclick="exportUsers()"><svg class="icon"><use href="#i-download"/></svg>خروجی CSV</button>
-                    <button class="btn btn-warning" onclick="bulkResetBandwidth()"><svg class="icon"><use href="#i-refresh"/></svg>ریست گروهی حجم</button>
-                    <button class="btn btn-danger" onclick="bulkDeleteUsers()"><svg class="icon"><use href="#i-trash"/></svg>حذف گروهی</button>
+                    <button class="btn btn-primary" onclick="showCreateModal()">➕ کاربر جدید</button>
+                    <button class="btn btn-success" onclick="exportUsers()">📥 خروجی CSV</button>
+                    <button class="btn btn-warning" onclick="bulkResetBandwidth()">🔄 ریست گروهی حجم</button>
+                    <button class="btn btn-danger" onclick="bulkDeleteUsers()">🗑️ حذف گروهی</button>
                 </div>
                 <div class="table-container">
                     <table>
@@ -2563,10 +2180,10 @@ function mgmtAdminHTML() {
             <!-- Plans Section -->
             <div id="plans-section" class="section" style="display:none">
                 <div class="toolbar">
-                    <h3 style="color:var(--text-secondary);display:flex;align-items:center;gap:0.45rem"><svg class="icon"><use href="#i-box"/></svg>مدیریت پلن‌ها</h3>
+                    <h3 style="color:var(--text-secondary)">📦 مدیریت پلن‌ها</h3>
                     <div style="display:flex;gap:0.5rem">
-                        <button class="btn btn-success" onclick="loadPlans().then(function(){flashBtn(this,'بروزرسانی شد')}.bind(this))"><svg class="icon"><use href="#i-refresh"/></svg>بروزرسانی</button>
-                        <button class="btn btn-primary" onclick="showCreatePlanModal()"><svg class="icon"><use href="#i-plus"/></svg>پلن جدید</button>
+                        <button class="btn btn-success" onclick="loadPlans().then(function(){flashBtn(this,'✅ بروزرسانی شد')}.bind(this))">🔄 بروزرسانی</button>
+                        <button class="btn btn-primary" onclick="showCreatePlanModal()">➕ پلن جدید</button>
                     </div>
                 </div>
                 <div class="table-container">
@@ -2591,8 +2208,8 @@ function mgmtAdminHTML() {
             <!-- Connections Section -->
             <div id="connections-section" class="section" style="display:none">
                 <div class="toolbar">
-                    <h3 style="color:var(--text-secondary);display:flex;align-items:center;gap:0.45rem"><svg class="icon"><use href="#i-link"/></svg>اتصالات فعال</h3>
-                    <button class="btn btn-success" onclick="loadConnections().then(function(){flashBtn(this,'بروزرسانی شد')}.bind(this))"><svg class="icon"><use href="#i-refresh"/></svg>بروزرسانی</button>
+                    <h3 style="color:var(--text-secondary)">🔗 اتصالات فعال</h3>
+                    <button class="btn btn-success" onclick="loadConnections().then(function(){flashBtn(this,'✅ بروزرسانی شد')}.bind(this))">🔄 بروزرسانی</button>
                 </div>
                 <div class="table-container">
                     <table>
@@ -2614,14 +2231,14 @@ function mgmtAdminHTML() {
             <!-- Logs Section -->
             <div id="logs-section" class="section" style="display:none">
                 <div class="toolbar">
-                    <h3 style="color:var(--text-secondary);display:flex;align-items:center;gap:0.45rem"><svg class="icon"><use href="#i-list"/></svg>تاریخچه اتصالات</h3>
+                    <h3 style="color:var(--text-secondary)">📋 تاریخچه اتصالات</h3>
                     <select id="logEventType" onchange="loadLogs()">
                         <option value="">همه رویدادها</option>
                         <option value="connect">اتصال</option>
                         <option value="disconnect">قطع اتصال</option>
                         <option value="error">خطا</option>
                     </select>
-                    <button class="btn btn-success" onclick="loadLogs().then(function(){flashBtn(this,'بروزرسانی شد')}.bind(this))"><svg class="icon"><use href="#i-refresh"/></svg>بروزرسانی</button>
+                    <button class="btn btn-success" onclick="loadLogs().then(function(){flashBtn(this,'✅ بروزرسانی شد')}.bind(this))">🔄 بروزرسانی</button>
                 </div>
                 <div class="table-container">
                     <table>
@@ -2643,12 +2260,11 @@ function mgmtAdminHTML() {
             <!-- Clean IPs Section -->
             <div id="cleanips-section" class="section" style="display:none">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;flex-wrap:wrap;gap:0.5rem">
-                    <h3 style="color:var(--text-secondary);display:flex;align-items:center;gap:0.45rem"><svg class="icon"><use href="#i-globe"/></svg>مدیریت Clean IP ها</h3>
+                    <h3 style="color:var(--text-secondary);">🌐 مدیریت Clean IP ها</h3>
                     <div style="display:flex;gap:0.3rem">
-                        <button class="btn btn-success btn-sm" onclick="testAllCleanIPs()" id="testAllBtn"><svg class="icon"><use href="#i-search"/></svg>تست همه</button>
-                        <button class="btn btn-outline btn-sm" onclick="copyAllCleanIPs()" id="copyAllCleanBtn">📋 کپی همه</button>
-                        <button class="btn btn-primary btn-sm" onclick="showBulkCleanIPModal()"><svg class="icon"><use href="#i-list"/></svg>افزودن گروهی</button>
-                        <button class="btn btn-primary btn-sm" onclick="showAddCleanIPModal()"><svg class="icon"><use href="#i-plus"/></svg>افزودن Clean IP</button>
+                        <button class="btn btn-success btn-sm" onclick="testAllCleanIPs()" id="testAllBtn">🔍 تست همه</button>
+                        <button class="btn btn-primary btn-sm" onclick="showBulkCleanIPModal()">📋 افزودن گروهی</button>
+                        <button class="btn btn-primary btn-sm" onclick="showAddCleanIPModal()">➕ افزودن Clean IP</button>
                     </div>
                 </div>
                 <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:1rem">IP های تمیز اینجا تعریف شده و به صورت خودکار در کانفیگ‌های کاربران نمایش داده می‌شوند.</p>
@@ -2658,7 +2274,7 @@ function mgmtAdminHTML() {
             <!-- Add/Edit Clean IP Modal -->
             <div id="cleanIPModal" class="modal">
                 <div class="modal-content" style="max-width:450px">
-                    <h2 id="cleanIPModalTitle">افزودن Clean IP</h2>
+                    <h2 id="cleanIPModalTitle">➕ افزودن Clean IP</h2>
                     <input type="hidden" id="cleanIPEditId">
                     <div class="form-group"><label>نام</label><input type="text" id="cleanIPName" placeholder="مثلاً: Cloudflare CDN"></div>
                     <div class="form-row">
@@ -2677,11 +2293,11 @@ function mgmtAdminHTML() {
             <!-- Bulk Add Clean IP Modal -->
             <div id="bulkCleanIPModal" class="modal">
                 <div class="modal-content" style="max-width:550px">
-                    <h2>افزودن گروهی Clean IP</h2>
-                    <p style="color:var(--text-secondary);font-size:0.8rem;margin-bottom:0.75rem">هر خط یک IP — همین کافیست. پورت اختیاری (پیش‌فرض 443)، نام اختیاری (خود IP می‌شود).</p>
-                    <p style="color:var(--text-secondary);font-size:0.75rem;margin-bottom:0.75rem">فرمت‌های قبول: <code style="background:var(--bg-primary);padding:0.1rem 0.3rem;border-radius:0.25rem">1.2.3.4:2087</code> · <code style="background:var(--bg-primary);padding:0.1rem 0.3rem;border-radius:0.25rem">1.2.3.4:2087#نام</code> · <code style="background:var(--bg-primary);padding:0.1rem 0.3rem;border-radius:0.25rem">نام | 1.2.3.4 | پورت | SNI</code></p>
+                    <h2>📋 افزودن گروهی Clean IP</h2>
+                    <p style="color:var(--text-secondary);font-size:0.8rem;margin-bottom:0.75rem">هر خط یک IP. فرمت: <code style="background:var(--bg-primary);padding:0.1rem 0.3rem;border-radius:0.25rem">نام | آی‌پی | پورت | SNI</code></p>
+                    <p style="color:var(--text-secondary);font-size:0.75rem;margin-bottom:0.75rem">پورت و SNI اختیاری هستند (پیش‌فرض: 443)</p>
                     <div class="form-group">
-                        <textarea id="bulkCleanIPInput" rows="12" style="width:100%;font-family:monospace;font-size:0.85rem;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border);border-radius:0.5rem;padding:0.75rem;resize:vertical" placeholder="104.17.16.190:2087&#10;104.17.122.1:2096#CF优选01&#10;104.16.0.1&#10;Cloudflare CDN | 104.16.0.1 | 443 | example.com"></textarea>
+                        <textarea id="bulkCleanIPInput" rows="12" style="width:100%;font-family:monospace;font-size:0.85rem;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border);border-radius:0.5rem;padding:0.75rem;resize:vertical" placeholder="Cloudflare CDN | 104.16.0.1 | 443 | example.com&#10;Fastly | 151.101.1.57 | 443&#10;Custom | 10.0.0.1 | 8443 | custom.sni.com"></textarea>
                     </div>
                     <div id="bulkCleanIPResult" style="display:none;padding:0.5rem;border-radius:0.5rem;margin-bottom:0.75rem;font-size:0.85rem"></div>
                     <div style="display:flex;gap:0.5rem;margin-top:1rem">
@@ -2693,7 +2309,7 @@ function mgmtAdminHTML() {
 
             <!-- Settings Section -->
             <div id="settings-section" class="section" style="display:none">
-                <h3 style="color:var(--text-secondary); margin-bottom:1rem;display:flex;align-items:center;gap:0.45rem"><svg class="icon"><use href="#i-gear"/></svg>تنظیمات سیستم</h3>
+                <h3 style="color:var(--text-secondary); margin-bottom:1rem;">⚙️ تنظیمات سیستم</h3>
                 <div style="background:var(--bg-secondary); padding:1.5rem; border-radius:0.75rem; border:1px solid var(--border); max-width:600px;">
                     <div class="form-group">
                         <label>نام سیستم</label>
@@ -2719,7 +2335,7 @@ function mgmtAdminHTML() {
                         <label>تغییر رمز عبور ادمین</label>
                         <input type="password" id="settingAdminPassword" placeholder="رمز عبور جدید (برای عدم تغییر، خالی بگذارید)">
                     </div>
-                    <button class="btn btn-primary" onclick="saveSettings()"><svg class="icon"><use href="#i-save"/></svg>ذخیره تنظیمات</button>
+                    <button class="btn btn-primary" onclick="saveSettings()">💾 ذخیره تنظیمات</button>
                 </div>
             </div>
         </div>
@@ -2760,10 +2376,9 @@ function mgmtAdminHTML() {
                     <label>آیدی تلگرام</label>
                     <input type="text" id="newTelegramId" placeholder="اختیاری">
                 </div>
-                <div class="form-group">
-                    <label>یادداشت</label>
-                    <input type="text" id="newNotes">
-                </div>
+            <div class="form-group">
+                <label>یادداشت</label>
+                <input type="text" id="newNotes">
             </div>
             <div class="form-group">
                 <label>کانفیگ‌های ضد فیلتر</label>
@@ -2782,7 +2397,7 @@ function mgmtAdminHTML() {
     <!-- Edit User Modal -->
     <div id="editModal" class="modal">
         <div class="modal-content">
-            <h2>ویرایش کاربر</h2>
+            <h2>✏️ ویرایش کاربر</h2>
             <input type="hidden" id="editUuid">
             <div class="form-group">
                 <label>نام کاربری</label>
@@ -2857,7 +2472,7 @@ function mgmtAdminHTML() {
     <!-- Config Modal -->
     <div id="configModal" class="modal">
         <div class="modal-content config-modal">
-            <h2>اطلاعات اشتراک</h2>
+            <h2>📋 اطلاعات اشتراک</h2>
             <div class="connection-info">
                 <div>
                     <h4>وضعیت اتصال</h4>
@@ -2873,12 +2488,11 @@ function mgmtAdminHTML() {
                 </div>
             </div>
             <div class="config-box" id="subConfig">-</div>
-            <h3 style="margin:1rem 0 0.5rem;color:var(--accent);font-size:0.9rem;display:flex;align-items:center;gap:0.45rem"><svg class="icon"><use href="#i-globe"/></svg>Clean IP ها</h3>
+            <h3 style="margin:1rem 0 0.5rem;color:var(--accent);font-size:0.9rem">🌐 Clean IP ها</h3>
             <div id="cleanIPs" style="max-height:300px;overflow-y:auto"></div>
             <div style="display:flex; gap:0.5rem;margin-top:1rem">
-                <button class="btn btn-primary" onclick="copyAllConfigs()" style="flex:2;background:var(--success)"><svg class="icon"><use href="#i-copy"/></svg>کپی همه کانفیگ‌ها</button>
-                <button class="btn btn-primary" onclick="copySubConfig()" style="flex:1"><svg class="icon"><use href="#i-link"/></svg>کپی لینک</button>
-                <button class="btn btn-warning" onclick="openUserPanel()" style="flex:1"><svg class="icon"><use href="#i-bolt"/></svg>پنل کاربر</button>
+                <button class="btn btn-primary" onclick="copyAllConfigs()" style="flex:2;background:var(--success)">📋 کپی همه کانفیگ‌ها</button>
+                <button class="btn btn-primary" onclick="copySubConfig()" style="flex:1">🔗 کپی لینک</button>
                 <button class="btn btn-danger" onclick="hideConfigModal()" style="flex:1">بستن</button>
             </div>
         </div>
@@ -2887,7 +2501,7 @@ function mgmtAdminHTML() {
     <!-- Create Plan Modal -->
     <div id="createPlanModal" class="modal">
         <div class="modal-content">
-            <h2>ایجاد پلن جدید</h2>
+            <h2>➕ ایجاد پلن جدید</h2>
             <div class="form-group">
                 <label>نام پلن</label>
                 <input type="text" id="planName" placeholder="نام پلن">
@@ -2926,7 +2540,7 @@ function mgmtAdminHTML() {
     <!-- Edit Plan Modal -->
     <div id="editPlanModal" class="modal">
         <div class="modal-content">
-            <h2>ویرایش پلن</h2>
+            <h2>✏️ ویرایش پلن</h2>
             <input type="hidden" id="editPlanId">
             <div class="form-group">
                 <label>نام پلن</label>
@@ -3037,13 +2651,13 @@ function mgmtAdminHTML() {
             else if (activeId === 'cleanips-section') promises.push(loadCleanIPs());
             else { promises.push(loadUsers()); }
             Promise.all(promises).finally(function() {
-                if (btn) { btn.disabled = false; btn.innerHTML = '<svg class="icon"><use href="#i-refresh"/></svg>بروزرسانی'; }
+                if (btn) { btn.disabled = false; btn.textContent = '🔄 بروزرسانی'; }
             });
         }
         function flashBtn(btn, text) {
             if (!btn) return;
             var orig = btn.textContent;
-            btn.innerHTML = text || '<svg class="icon"><use href="#i-check"/></svg>';
+            btn.textContent = text || '✅';
             btn.disabled = true;
             setTimeout(function() { btn.textContent = orig; btn.disabled = false; }, 1000);
         }
@@ -3128,10 +2742,10 @@ function mgmtAdminHTML() {
                         '<td>' + (u.total_requests || 0) + '</td>' +
                         '<td>' + (u.expires_at ? new Date(u.expires_at).toLocaleDateString('fa-IR') : '∞') + '</td>' +
                         '<td style="white-space:nowrap">' +
-                            '<button class="btn btn-primary btn-sm" onclick="showConfigModal(' + "'" + u.uuid + "'" + ')"><svg class="icon"><use href="#i-copy"/></svg></button> ' +
-                            '<button class="btn btn-success btn-sm" onclick="showEditModal(' + "'" + u.uuid + "'" + ')"><svg class="icon"><use href="#i-edit"/></svg></button> ' +
-                            '<button class="btn btn-warning btn-sm" onclick="resetUUID(' + "'" + u.uuid + "'" + ')"><svg class="icon"><use href="#i-refresh"/></svg></button> ' +
-                            '<button class="btn btn-danger btn-sm" onclick="doDeleteUser(' + "'" + u.uuid + "'" + ')"><svg class="icon"><use href="#i-trash"/></svg></button>' +
+                            '<button class="btn btn-primary btn-sm" onclick="showConfigModal(' + "'" + u.uuid + "'" + ')">📋</button> ' +
+                            '<button class="btn btn-success btn-sm" onclick="showEditModal(' + "'" + u.uuid + "'" + ')">✏️</button> ' +
+                            '<button class="btn btn-warning btn-sm" onclick="resetUUID(' + "'" + u.uuid + "'" + ')">🔄</button> ' +
+                            '<button class="btn btn-danger btn-sm" onclick="doDeleteUser(' + "'" + u.uuid + "'" + ')">🗑️</button>' +
                         '</td></tr>';
                 }).join('');
 
@@ -3378,7 +2992,7 @@ function mgmtAdminHTML() {
                 if (d.config) {
                     document.getElementById('subConfig').textContent = d.config.subscription;
                     if (d.connection) {
-                        document.getElementById('connStatus').textContent = d.connection.status === 'excellent' ? 'عالی' : d.connection.status === 'good' ? 'خوب' : 'ضعیف';
+                        document.getElementById('connStatus').textContent = d.connection.status === 'excellent' ? 'عالی ✅' : d.connection.status === 'good' ? 'خوب ⚠️' : 'ضعیف ❌';
                         document.getElementById('connPing').textContent = d.connection.ping > 0 ? d.connection.ping + ' ms' : '-';
                         document.getElementById('connCode').textContent = d.connection.code || '-';
                     }
@@ -3393,7 +3007,7 @@ function mgmtAdminHTML() {
                         cleanHTML += '<div style="background:var(--bg-primary);padding:0.5rem;border-radius:0.5rem;margin-bottom:0.5rem">';
                         cleanHTML += '<div style="display:flex;justify-content:space-between;align-items:center">';
                         cleanHTML += '<span style="color:var(--accent);font-weight:600;font-size:0.85rem">' + ip.name + '</span>';
-                        cleanHTML += '<button class="btn btn-sm btn-outline" onclick="safeCopy(' + "'" + ip.link.replace(/'/g, "\\'") + "'" + ')"><svg class="icon"><use href="#i-copy"/></svg></button>';
+                        cleanHTML += '<button class="btn btn-sm btn-outline" onclick="safeCopy(\'' + ip.link.replace(/'/g, "\\'") + '\')">📋</button>';
                         cleanHTML += '</div>';
                         cleanHTML += '<div style="font-size:0.75rem;color:var(--text-secondary);margin-top:0.25rem">' + ip.note + '</div>';
                         cleanHTML += '<div style="font-family:monospace;font-size:0.65rem;color:var(--text-secondary);word-break:break-all;margin-top:0.25rem;max-height:40px;overflow:hidden">' + ip.link + '</div>';
@@ -3405,46 +3019,39 @@ function mgmtAdminHTML() {
         }
 
         function hideConfigModal() { document.getElementById('configModal').classList.remove('active'); }
-        function openUserPanel() {
-            var sub = document.getElementById('subConfig').textContent.trim();
-            if (!sub || sub.indexOf('https://') !== 0) { alert('لینک اشتراک آماده نیست'); return; }
-            window.open(sub.replace('/sub?', '/user-panel?'), '_blank');
+        function safeCopy(text) {
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(function(){alert('کپی شد!');}).catch(function(){fallbackCopyText(text);});
+            } else { fallbackCopyText(text); }
+            function fallbackCopyText(t) {
+                var ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); alert('کپی شد!');
+            }
         }
-        function fallbackCopyText(text, msg) {
-            var ta = document.createElement('textarea');
-            ta.value = text;
-            ta.style.position = 'fixed';
-            ta.style.top = '-9999px';
-            document.body.appendChild(ta);
-            ta.select();
-            try { document.execCommand('copy'); alert(msg); }
-            catch (err) { alert('❌ خطا در کپی'); }
-            document.body.removeChild(ta);
-        }
-
         function copySubConfig() {
             var text = document.getElementById('subConfig').textContent;
-            var msg = '✅ کپی شد!';
             if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(text).then(function(){ alert(msg); }).catch(function(){ fallbackCopyText(text, msg); });
-            } else { fallbackCopyText(text, msg); }
+                navigator.clipboard.writeText(text).then(function(){alert('کپی شد!');}).catch(fallbackCopy);
+            } else { fallbackCopy(); }
+            function fallbackCopy() {
+                var ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); alert('کپی شد!');
+            }
         }
-
-        function safeCopy(text) {
-            var msg = '✅ کپی شد!';
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(text).then(function(){ alert(msg); }).catch(function(){ fallbackCopyText(text, msg); });
-            } else { fallbackCopyText(text, msg); }
-        }
-
         var _currentCleanIPLinks = [];
         function copyAllConfigs() {
-            if (!_currentCleanIPLinks || _currentCleanIPLinks.length === 0) { alert('کانفیگی برای کپی وجود ندارد'); return; }
+            if (_currentCleanIPLinks.length === 0) { alert('کانفیگی برای کپی وجود ندارد'); return; }
             var allText = _currentCleanIPLinks.join('\\n');
-            var msg = '✅ ' + _currentCleanIPLinks.length + ' کانفیگ کپی شد!';
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(allText).then(function(){ alert(msg); }).catch(function(){ fallbackCopyText(allText, msg); });
-            } else { fallbackCopyText(allText, msg); }
+            navigator.clipboard.writeText(allText).then(function() {
+                alert('✅ ' + _currentCleanIPLinks.length + ' کانفیگ کپی شد!');
+            }).catch(function() {
+                // Fallback
+                var ta = document.createElement('textarea');
+                ta.value = allText;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                alert('✅ ' + _currentCleanIPLinks.length + ' کانفیگ کپی شد!');
+            });
         }
 
         // ============================================
@@ -3464,7 +3071,7 @@ function mgmtAdminHTML() {
                     '<td>' + p.duration_days + '</td>' +
                     '<td>' + formatPrice(p.price) + '</td>' +
                     '<td>' + (p.is_active ? '<span class="badge badge-success">فعال</span>' : '<span class="badge badge-danger">غیرفعال</span>') + '</td>' +
-                    '<td><button class="btn btn-success btn-sm" onclick="showEditPlanModal(' + p.id + ')"><svg class="icon"><use href="#i-edit"/></svg></button> <button class="btn btn-danger btn-sm" onclick="deletePlan(' + p.id + ')"><svg class="icon"><use href="#i-trash"/></svg></button></td>' +
+                    '<td><button class="btn btn-success btn-sm" onclick="showEditPlanModal(' + p.id + ')">✏️</button> <button class="btn btn-danger btn-sm" onclick="deletePlan(' + p.id + ')">🗑️</button></td>' +
                 '</tr>').join('');
 
                 // Update plan dropdown in create modal
@@ -3671,13 +3278,13 @@ function mgmtAdminHTML() {
                 var html = '';
                 for (var i = 0; i < list.length; i++) {
                     var c = list[i];
-                    var statusBadge = c.is_active ? '<span style="color:var(--success);display:inline-flex;align-items:center;gap:0.3rem"><svg class="icon"><use href="#i-check"/></svg>فعال</span>' : '<span style="color:var(--danger);display:inline-flex;align-items:center;gap:0.3rem"><svg class="icon"><use href="#i-x"/></svg>غیرفعال</span>';
+                    var statusBadge = c.is_active ? '<span style="color:var(--success)">✅ فعال</span>' : '<span style="color:var(--danger)">❌ غیرفعال</span>';
                     var testResult = _cleanIPTestResults[c.id];
                     var testBadge = '';
                     if (testResult) {
                         var tColor = testResult.status === 'excellent' ? 'var(--success)' : testResult.status === 'good' ? '#22d3ee' : testResult.status === 'poor' ? 'var(--warning)' : testResult.status === 'cert_error' ? 'var(--warning)' : 'var(--danger)';
-                        var tIcon = '<svg class="icon filled" style="color:' + (testResult.status === 'excellent' || testResult.status === 'good' ? 'var(--success)' : (testResult.status === 'poor' || testResult.status === 'cert_error' ? '#f59e0b' : 'var(--danger)')) + '"><use href="#i-dot"/></svg>';
-                        var tLabel = testResult.status === 'cert_error' ? 'گواهی' : testResult.status === 'timeout' ? 'تایم‌اوت' : testResult.status;
+                        var tIcon = testResult.status === 'excellent' ? '🟢' : testResult.status === 'good' ? '🟢' : testResult.status === 'poor' ? '🟡' : testResult.status === 'cert_error' ? '🟡' : '🔴';
+                        var tLabel = testResult.status === 'cert_error' ? '⚠️ گواهی' : testResult.status === 'timeout' ? '⏱️ تایم‌اوت' : testResult.status;
                         testBadge = ' <span style="font-size:0.75rem;color:' + tColor + '">' + tIcon + ' ' + tLabel + (testResult.latency > 0 ? ' (' + testResult.latency + 'ms)' : '') + '</span>';
                     }
                     html += '<div style="background:var(--bg-secondary);padding:1rem;border-radius:0.75rem;border:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem">';
@@ -3688,10 +3295,9 @@ function mgmtAdminHTML() {
                     html += '</div>';
                     html += '<div style="display:flex;gap:0.3rem;align-items:center">';
                     html += statusBadge;
-                    html += '<button class="btn btn-outline btn-sm" onclick="copyCleanIPRow(' + c.id + ')" title="کپی برای انتقال به وورکر دیگر">📋</button>';
-                    html += '<button class="btn btn-outline btn-sm" onclick="toggleCleanIP(' + c.id + ',' + (c.is_active ? 0 : 1) + ')"><svg class="icon filled" style="color:' + (c.is_active ? 'var(--danger)' : 'var(--success)') + '"><use href="#i-dot"/></svg></button>';
-                    html += '<button class="btn btn-outline btn-sm" onclick="editCleanIP(' + c.id + ')"><svg class="icon"><use href="#i-edit"/></svg></button>';
-                    html += '<button class="btn btn-danger btn-sm" onclick="deleteCleanIP(' + c.id + ')"><svg class="icon"><use href="#i-trash"/></svg></button>';
+                    html += '<button class="btn btn-outline btn-sm" onclick="toggleCleanIP(' + c.id + ',' + (c.is_active ? 0 : 1) + ')">' + (c.is_active ? '🔴' : '🟢') + '</button>';
+                    html += '<button class="btn btn-outline btn-sm" onclick="editCleanIP(' + c.id + ')">✏️</button>';
+                    html += '<button class="btn btn-danger btn-sm" onclick="deleteCleanIP(' + c.id + ')">🗑️</button>';
                     html += '</div></div>';
                 }
                 document.getElementById('cleanIPsList').innerHTML = html;
@@ -3699,7 +3305,7 @@ function mgmtAdminHTML() {
         }
         function escH(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
         function showAddCleanIPModal() {
-            document.getElementById('cleanIPModalTitle').textContent = 'افزودن Clean IP';
+            document.getElementById('cleanIPModalTitle').textContent = '➕ افزودن Clean IP';
             document.getElementById('cleanIPEditId').value = '';
             document.getElementById('cleanIPName').value = '';
             document.getElementById('cleanIPIP').value = '';
@@ -3712,7 +3318,7 @@ function mgmtAdminHTML() {
         function editCleanIP(id) {
             var c = _cleanIPCache.find(function(x){ return x.id === id; });
             if (!c) return;
-            document.getElementById('cleanIPModalTitle').textContent = 'ویرایش Clean IP';
+            document.getElementById('cleanIPModalTitle').textContent = '✏️ ویرایش Clean IP';
             document.getElementById('cleanIPEditId').value = c.id;
             document.getElementById('cleanIPName').value = c.name;
             document.getElementById('cleanIPIP').value = c.ip;
@@ -3781,68 +3387,21 @@ function mgmtAdminHTML() {
         }
         function hideBulkCleanIPModal() { document.getElementById('bulkCleanIPModal').classList.remove('active'); }
 
-        // Parse clean-IP lines in ANY of these formats:
-        //   1.2.3.4   |  1.2.3.4:2087  |  1.2.3.4:2087#Name  |  Name | 1.2.3.4 | Port | SNI
-        function parseCleanIPLines(raw) {
-            var lines = raw.split(/\\r?\\n/);
-            var items = [];
-            for (var i = 0; i < lines.length; i++) {
-                var line = lines[i].trim();
-                if (!line || line.charAt(0) === '#') continue;
-                if (line.indexOf('|') !== -1) {
-                    var parts = line.split('|').map(function(p){ return p.trim(); });
-                    var pip = (parts[1] || parts[0] || '').trim();
-                    if (!pip) continue;
-                    items.push({ name: (parts[1] ? parts[0] : pip) || pip, ip: pip, port: parseInt(parts[2]) || 443, sni: parts[3] || '' });
-                    continue;
-                }
-                var name = '';
-                var hash = line.indexOf('#');
-                if (hash !== -1) { name = line.slice(hash + 1).trim(); line = line.slice(0, hash).trim(); }
-                var port = 443;
-                var addr = line;
-                var colon = line.lastIndexOf(':');
-                if (colon !== -1 && /^\\d+$/.test(line.slice(colon + 1))) {
-                    port = parseInt(line.slice(colon + 1)) || 443;
-                    addr = line.slice(0, colon);
-                }
-                if (!addr) continue;
-                items.push({ name: name || addr, ip: addr, port: port, sni: '' });
-            }
-            return items;
-        }
-        async function copyToClipboard(text) {
-            try { await navigator.clipboard.writeText(text); return true; } catch (e) {}
-            try {
-                var ta = document.createElement('textarea');
-                ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-                document.body.appendChild(ta); ta.select();
-                var ok = document.execCommand('copy');
-                document.body.removeChild(ta);
-                return ok;
-            } catch (e2) { return false; }
-        }
-        function cleanIPExportLine(c) {
-            // Copy format = what "افزودن گروهی" accepts: IP:PORT#Name (SNI rows use pipe form)
-            return c.sni ? (c.name + ' | ' + c.ip + ' | ' + c.port + ' | ' + c.sni) : (c.ip + ':' + c.port + '#' + c.name);
-        }
-        async function copyCleanIPRow(id) {
-            var c = _cleanIPCache.find(function(x){ return x.id === id; });
-            if (!c) return;
-            var line = cleanIPExportLine(c);
-            var ok = await copyToClipboard(line);
-            alert(ok ? 'کپی شد:\\n' + line + '\\n\\nدر وورکر دیگر: افزودن گروهی → Paste' : 'کپی ناموفق — مرورگر اجازه نداد');
-        }
-        async function copyAllCleanIPs() {
-            if (!_cleanIPCache || !_cleanIPCache.length) { alert('لیست خالی است'); return; }
-            var lines = _cleanIPCache.map(cleanIPExportLine);
-            var ok = await copyToClipboard(lines.join('\\n'));
-            alert(ok ? lines.length + ' ردیف کپی شد — در وورکر دیگر: افزودن گروهی → Paste' : 'کپی ناموفق — مرورگر اجازه نداد');
-        }
         async function saveBulkCleanIPs() {
             var raw = document.getElementById('bulkCleanIPInput').value.trim();
             if (!raw) { alert('لطفاً IP ها را وارد کنید'); return; }
-            var items = parseCleanIPLines(raw);
+            var lines = raw.split('\\n').filter(function(l){ return l.trim(); });
+            var items = [];
+            for (var i = 0; i < lines.length; i++) {
+                var parts = lines[i].split('|').map(function(p){ return p.trim(); });
+                if (!parts[0]) continue;
+                items.push({
+                    name: parts[0] || '',
+                    ip: parts[1] || '',
+                    port: parseInt(parts[2]) || 443,
+                    sni: parts[3] || ''
+                });
+            }
             if (!items.length) { alert('هیچ IP معتبری یافت نشد'); return; }
             var btn = document.getElementById('bulkSaveBtn');
             btn.textContent = '⏳ در حال ذخیره...';
@@ -3888,7 +3447,7 @@ function mgmtAdminHTML() {
             _cleanIPTestResults = {};
             var activeIPs = _cleanIPCache.filter(function(c){ return c.is_active && c.ip; });
             if (!activeIPs.length) {
-                btn.innerHTML = '<svg class="icon"><use href="#i-search"/></svg>تست همه';
+                btn.textContent = '🔍 تست همه';
                 btn.disabled = false;
                 alert('هیچ IP فعالی برای تست وجود ندارد');
                 return;
@@ -3909,7 +3468,7 @@ function mgmtAdminHTML() {
             } catch(e) {
                 alert('خطا در تست');
             }
-            btn.innerHTML = '<svg class="icon"><use href="#i-search"/></svg>تست همه';
+            btn.textContent = '🔍 تست همه';
             btn.disabled = false;
         }
 
@@ -3953,8 +3512,8 @@ function mgmtAdminHTML() {
                         datasets: [{
                             label: 'مصرف ترافیک (MB)',
                             data,
-                            borderColor: '#38bdf8',
-                            backgroundColor: 'rgba(56,189,248,0.12)',
+                            borderColor: '#3b82f6',
+                            backgroundColor: 'rgba(59,130,246,0.1)',
                             fill: true,
                             tension: 0.4
                         }]
@@ -3962,11 +3521,10 @@ function mgmtAdminHTML() {
                     options: {
                         responsive: true,
                         maintainAspectRatio: false,
-                        borderColor: 'rgba(56,189,248,0.4)',
-                        plugins: { legend: { labels: { color: '#94a3b8', font: { family: "'Segoe UI', Tahoma" } } } },
+                        plugins: { legend: { labels: { color: '#94a3b8' } } },
                         scales: {
-                            x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.12)' } },
-                            y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.12)' } }
+                            x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
+                            y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
                         }
                     }
                 });
@@ -4008,91 +3566,30 @@ function mgmtStatusHTML() {
     <title>بررسی وضعیت - Edge Manager</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, sans-serif; color: #f1f5f9; min-height: 100vh;
-            display: flex; justify-content: center; align-items: center; padding: 1rem;
-            background:
-                radial-gradient(900px 460px at 80% -10%, rgba(56,189,248,0.14), transparent 60%),
-                radial-gradient(800px 420px at 10% 110%, rgba(129,140,248,0.13), transparent 58%),
-                linear-gradient(160deg, #0a0e1a 0%, #0d1226 48%, #0a0e1a 100%);
-            background-attachment: fixed;
-        }
-        body::before {
-            content: ''; position: fixed; inset: 0; pointer-events: none; opacity: 0.45;
-            background-image: linear-gradient(rgba(148,163,184,0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(148,163,184,0.045) 1px, transparent 1px);
-            background-size: 44px 44px;
-            -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 35%, #000 30%, transparent 78%);
-            mask-image: radial-gradient(ellipse 90% 70% at 50% 35%, #000 30%, transparent 78%);
-        }
-        @keyframes floatUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
-        .container {
-            position: relative; z-index: 1;
-            background: rgba(17, 24, 39, 0.66);
-            backdrop-filter: blur(20px) saturate(1.25); -webkit-backdrop-filter: blur(20px) saturate(1.25);
-            padding: 2.2rem 2rem; border-radius: 20px; width: 100%; max-width: 420px;
-            border: 1px solid rgba(148, 163, 184, 0.16);
-            box-shadow: 0 10px 40px -12px rgba(0,0,0,0.55), 0 0 28px -10px rgba(56,189,248,0.35);
-            animation: floatUp 0.5s ease both;
-        }
-        h1 {
-            margin-bottom: 1.6rem; text-align: center; font-size: 1.2rem; font-weight: 700;
-            display: flex; align-items: center; justify-content: center; gap: 0.55rem;
-            background: linear-gradient(120deg, #38bdf8, #818cf8);
-            -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
-        }
-        h1 .logo { -webkit-text-fill-color: initial; }
-        .icon { width: 1.05em; height: 1.05em; vertical-align: -0.18em; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-        .logo { width: 1.7em; height: 1.7em; animation: logoGlow 3.2s ease-in-out infinite; }
-        @keyframes logoGlow { 0%,100% { filter: drop-shadow(0 0 3px rgba(56,189,248,0.4)); } 50% { filter: drop-shadow(0 0 10px rgba(56,189,248,0.75)); } }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: flex; justify-content: center; align-items: center; }
+        .container { background: #1e293b; padding: 2rem; border-radius: 1rem; width: 100%; max-width: 400px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+        h1 { color: #60a5fa; margin-bottom: 1.5rem; text-align: center; }
         .form-group { margin-bottom: 1rem; }
-        .form-group input {
-            width: 100%; padding: 0.8rem 1rem; border: 1px solid rgba(148,163,184,0.18); border-radius: 10px;
-            background: rgba(10, 14, 26, 0.7); color: #f1f5f9; text-align: center; font-size: 0.95rem;
-            transition: border-color 0.2s, box-shadow 0.2s;
-            font-family: ui-monospace, monospace; letter-spacing: 0.4px;
-        }
-        .form-group input:focus { outline: none; border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56,189,248,0.16); }
-        .form-group input::placeholder { font-family: 'Segoe UI', Tahoma; letter-spacing: 0; color: #64748b; }
-        .btn {
-            width: 100%; padding: 0.8rem; background: linear-gradient(135deg, #38bdf8, #818cf8); color: #071018;
-            border: none; border-radius: 10px; cursor: pointer; font-size: 1rem; font-weight: 700;
-            transition: transform 0.15s, filter 0.2s, box-shadow 0.2s;
-            box-shadow: 0 0 24px -6px rgba(56,189,248,0.45);
-        }
-        .btn:hover { transform: translateY(-1px); filter: brightness(1.08); box-shadow: 0 0 32px -6px rgba(56,189,248,0.6); }
-        .btn:active { transform: translateY(0); }
-        .result {
-            margin-top: 1.4rem; padding: 1.1rem 1.2rem; background: rgba(10, 14, 26, 0.7);
-            border: 1px solid rgba(148,163,184,0.14); border-radius: 14px; display: none;
-        }
-        .result.show { display: block; animation: floatUp 0.3s ease both; }
-        .row { display: flex; justify-content: space-between; padding: 0.55rem 0; border-bottom: 1px solid rgba(148,163,184,0.12); }
+        .form-group input { width: 100%; padding: 0.75rem; border: 1px solid #334155; border-radius: 0.5rem; background: #0f172a; color: #e2e8f0; text-align: center; font-size: 1rem; }
+        .btn { width: 100%; padding: 0.75rem; background: #3b82f6; color: white; border: none; border-radius: 0.5rem; cursor: pointer; font-size: 1rem; font-weight: 600; }
+        .btn:hover { background: #2563eb; }
+        .result { margin-top: 1.5rem; padding: 1rem; background: #0f172a; border-radius: 0.5rem; display: none; }
+        .result.show { display: block; }
+        .row { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #334155; }
         .row:last-child { border-bottom: none; }
-        .label { color: #94a3b8; font-size: 0.88rem; }
-        .value { color: #38bdf8; font-weight: 700; font-variant-numeric: tabular-nums; }
-        .active { color: #34d399 !important; text-shadow: 0 0 14px rgba(52,211,153,0.4); }
-        .inactive { color: #f87171 !important; text-shadow: 0 0 14px rgba(248,113,113,0.4); }
-        .progress { height: 7px; background: rgba(148,163,184,0.14); border-radius: 999px; overflow: hidden; margin-top: 0.7rem; }
-        .progress-bar { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #38bdf8, #818cf8); box-shadow: 0 0 10px -2px rgba(56,189,248,0.7); transition: width 0.35s ease; }
-        .progress-bar.warning { background: linear-gradient(90deg, #fbbf24, #f59e0b); box-shadow: 0 0 10px -2px rgba(251,191,36,0.7); }
-        .progress-bar.danger { background: linear-gradient(90deg, #f87171, #ef4444); box-shadow: 0 0 10px -2px rgba(248,113,113,0.7); }
+        .label { color: #94a3b8; }
+        .value { color: #60a5fa; font-weight: bold; }
+        .active { color: #10b981 !important; }
+        .inactive { color: #ef4444 !important; }
+        .progress { height: 8px; background: #334155; border-radius: 4px; overflow: hidden; margin-top: 0.5rem; }
+        .progress-bar { height: 100%; background: #3b82f6; }
+        .progress-bar.warning { background: #f59e0b; }
+        .progress-bar.danger { background: #ef4444; }
     </style>
 </head>
 <body>
-    <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
-        <defs>
-            <linearGradient id="shieldGrad" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0%" stop-color="#60a5fa"/><stop offset="100%" stop-color="#2563eb"/>
-            </linearGradient>
-        </defs>
-        <symbol id="s-logo" viewBox="0 0 24 24">
-            <path d="M12 2 L20 5.5 V11 C20 16.5 16.6 20.6 12 22 C7.4 20.6 4 16.5 4 11 V5.5 Z" fill="url(#shieldGrad)" stroke="none" opacity="0.95"/>
-            <path d="M8.6 11.6 L11 14 L15.6 8.6" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-        </symbol>
-        <symbol id="s-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
-    </svg>
     <div class="container">
-        <h1><svg class="icon logo"><use href="#s-logo"/></svg>بررسی وضعیت اشتراک</h1>
+        <h1>🔍 بررسی وضعیت اشتراک</h1>
         <div class="form-group">
             <input type="text" id="uuidInput" placeholder="UUID خود را وارد کنید">
         </div>
@@ -4117,7 +3614,7 @@ function mgmtStatusHTML() {
                 if (d.user) {
                     const u = d.user;
                     document.getElementById('resultBox').classList.add('show');
-                    document.getElementById('resStatus').textContent = u.is_active ? 'فعال' : 'غیرفعال';
+                    document.getElementById('resStatus').textContent = u.is_active ? 'فعال ✅' : 'غیرفعال ❌';
                     document.getElementById('resStatus').className = 'value ' + (u.is_active ? 'active' : 'inactive');
                     document.getElementById('resUsername').textContent = u.username || '-';
 
@@ -4145,336 +3642,6 @@ function mgmtStatusHTML() {
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
     </script>
-</body>
-</html>`;
-}
-
-// ============================================
-// USER SUBSCRIPTION PANEL (self-service page)
-// Served at /user-status?token=... (or uuid=...) — same token scheme as /sub.
-// Shows traffic/expiry/devices, configs, QR codes, and one-click app-import links.
-// ============================================
-
-const QR_LIB = "/**\n * Minified by jsDelivr using Terser v5.37.0.\n * Original file: /npm/qrcode-generator@1.4.4/qrcode.js\n *\n * Do NOT use SRI with dynamically generated files! More information: https://www.jsdelivr.com/using-sri-with-dynamic-files\n */\nvar qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],f={},c=function(t,r){o=function(t){for(var r=new Array(t),e=0;e<t;e+=1){r[e]=new Array(t);for(var n=0;n<t;n+=1)r[e][n]=null}return r}(i=4*e+17),l(0,0),l(i-7,0),l(0,i-7),s(),h(),d(t,r),e>=7&&v(t),null==a&&(a=p(e,n,u)),w(a,r)},l=function(t,r){for(var e=-1;e<=7;e+=1)if(!(t+e<=-1||i<=t+e))for(var n=-1;n<=7;n+=1)r+n<=-1||i<=r+n||(o[t+e][r+n]=0<=e&&e<=6&&(0==n||6==n)||0<=n&&n<=6&&(0==e||6==e)||2<=e&&e<=4&&2<=n&&n<=4)},h=function(){for(var t=8;t<i-8;t+=1)null==o[t][6]&&(o[t][6]=t%2==0);for(var r=8;r<i-8;r+=1)null==o[6][r]&&(o[6][r]=r%2==0)},s=function(){for(var t=B.getPatternPosition(e),r=0;r<t.length;r+=1)for(var n=0;n<t.length;n+=1){var i=t[r],a=t[n];if(null==o[i][a])for(var u=-2;u<=2;u+=1)for(var f=-2;f<=2;f+=1)o[i+u][a+f]=-2==u||2==u||-2==f||2==f||0==u&&0==f}},v=function(t){for(var r=B.getBCHTypeNumber(e),n=0;n<18;n+=1){var a=!t&&1==(r>>n&1);o[Math.floor(n/3)][n%3+i-8-3]=a}for(n=0;n<18;n+=1){a=!t&&1==(r>>n&1);o[n%3+i-8-3][Math.floor(n/3)]=a}},d=function(t,r){for(var e=n<<3|r,a=B.getBCHTypeInfo(e),u=0;u<15;u+=1){var f=!t&&1==(a>>u&1);u<6?o[u][8]=f:u<8?o[u+1][8]=f:o[i-15+u][8]=f}for(u=0;u<15;u+=1){f=!t&&1==(a>>u&1);u<8?o[8][i-u-1]=f:u<9?o[8][15-u-1+1]=f:o[8][15-u-1]=f}o[i-8][8]=!t},w=function(t,r){for(var e=-1,n=i-1,a=7,u=0,f=B.getMaskFunction(r),c=i-1;c>0;c-=2)for(6==c&&(c-=1);;){for(var g=0;g<2;g+=1)if(null==o[n][c-g]){var l=!1;u<t.length&&(l=1==(t[u]>>>a&1)),f(n,c-g)&&(l=!l),o[n][c-g]=l,-1==(a-=1)&&(u+=1,a=7)}if((n+=e)<0||i<=n){n-=e,e=-e;break}}},p=function(t,r,e){for(var n=A.getRSBlocks(t,r),o=b(),i=0;i<e.length;i+=1){var a=e[i];o.put(a.getMode(),4),o.put(a.getLength(),B.getLengthInBits(a.getMode(),t)),a.write(o)}var u=0;for(i=0;i<n.length;i+=1)u+=n[i].dataCount;if(o.getLengthInBits()>8*u)throw\"code length overflow. (\"+o.getLengthInBits()+\">\"+8*u+\")\";for(o.getLengthInBits()+4<=8*u&&o.put(0,4);o.getLengthInBits()%8!=0;)o.putBit(!1);for(;!(o.getLengthInBits()>=8*u||(o.put(236,8),o.getLengthInBits()>=8*u));)o.put(17,8);return function(t,r){for(var e=0,n=0,o=0,i=new Array(r.length),a=new Array(r.length),u=0;u<r.length;u+=1){var f=r[u].dataCount,c=r[u].totalCount-f;n=Math.max(n,f),o=Math.max(o,c),i[u]=new Array(f);for(var g=0;g<i[u].length;g+=1)i[u][g]=255&t.getBuffer()[g+e];e+=f;var l=B.getErrorCorrectPolynomial(c),h=k(i[u],l.getLength()-1).mod(l);for(a[u]=new Array(l.getLength()-1),g=0;g<a[u].length;g+=1){var s=g+h.getLength()-a[u].length;a[u][g]=s>=0?h.getAt(s):0}}var v=0;for(g=0;g<r.length;g+=1)v+=r[g].totalCount;var d=new Array(v),w=0;for(g=0;g<n;g+=1)for(u=0;u<r.length;u+=1)g<i[u].length&&(d[w]=i[u][g],w+=1);for(g=0;g<o;g+=1)for(u=0;u<r.length;u+=1)g<a[u].length&&(d[w]=a[u][g],w+=1);return d}(o,n)};f.addData=function(t,r){var e=null;switch(r=r||\"Byte\"){case\"Numeric\":e=M(t);break;case\"Alphanumeric\":e=x(t);break;case\"Byte\":e=m(t);break;case\"Kanji\":e=L(t);break;default:throw\"mode:\"+r}u.push(e),a=null},f.isDark=function(t,r){if(t<0||i<=t||r<0||i<=r)throw t+\",\"+r;return o[t][r]},f.getModuleCount=function(){return i},f.make=function(){if(e<1){for(var t=1;t<40;t++){for(var r=A.getRSBlocks(t,n),o=b(),i=0;i<u.length;i++){var a=u[i];o.put(a.getMode(),4),o.put(a.getLength(),B.getLengthInBits(a.getMode(),t)),a.write(o)}var g=0;for(i=0;i<r.length;i++)g+=r[i].dataCount;if(o.getLengthInBits()<=8*g)break}e=t}c(!1,function(){for(var t=0,r=0,e=0;e<8;e+=1){c(!0,e);var n=B.getLostPoint(f);(0==e||t>n)&&(t=n,r=e)}return r}())},f.createTableTag=function(t,r){t=t||2;var e=\"\";e+='<table style=\"',e+=\" border-width: 0px; border-style: none;\",e+=\" border-collapse: collapse;\",e+=\" padding: 0px; margin: \"+(r=void 0===r?4*t:r)+\"px;\",e+='\">',e+=\"<tbody>\";for(var n=0;n<f.getModuleCount();n+=1){e+=\"<tr>\";for(var o=0;o<f.getModuleCount();o+=1)e+='<td style=\"',e+=\" border-width: 0px; border-style: none;\",e+=\" border-collapse: collapse;\",e+=\" padding: 0px; margin: 0px;\",e+=\" width: \"+t+\"px;\",e+=\" height: \"+t+\"px;\",e+=\" background-color: \",e+=f.isDark(n,o)?\"#000000\":\"#ffffff\",e+=\";\",e+='\"/>';e+=\"</tr>\"}return e+=\"</tbody>\",e+=\"</table>\"},f.createSvgTag=function(t,r,e,n){var o={};\"object\"==typeof arguments[0]&&(t=(o=arguments[0]).cellSize,r=o.margin,e=o.alt,n=o.title),t=t||2,r=void 0===r?4*t:r,(e=\"string\"==typeof e?{text:e}:e||{}).text=e.text||null,e.id=e.text?e.id||\"qrcode-description\":null,(n=\"string\"==typeof n?{text:n}:n||{}).text=n.text||null,n.id=n.text?n.id||\"qrcode-title\":null;var i,a,u,c,g=f.getModuleCount()*t+2*r,l=\"\";for(c=\"l\"+t+\",0 0,\"+t+\" -\"+t+\",0 0,-\"+t+\"z \",l+='<svg version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\"',l+=o.scalable?\"\":' width=\"'+g+'px\" height=\"'+g+'px\"',l+=' viewBox=\"0 0 '+g+\" \"+g+'\" ',l+=' preserveAspectRatio=\"xMinYMin meet\"',l+=n.text||e.text?' role=\"img\" aria-labelledby=\"'+y([n.id,e.id].join(\" \").trim())+'\"':\"\",l+=\">\",l+=n.text?'<title id=\"'+y(n.id)+'\">'+y(n.text)+\"</title>\":\"\",l+=e.text?'<description id=\"'+y(e.id)+'\">'+y(e.text)+\"</description>\":\"\",l+='<rect width=\"100%\" height=\"100%\" fill=\"white\" cx=\"0\" cy=\"0\"/>',l+='<path d=\"',a=0;a<f.getModuleCount();a+=1)for(u=a*t+r,i=0;i<f.getModuleCount();i+=1)f.isDark(a,i)&&(l+=\"M\"+(i*t+r)+\",\"+u+c);return l+='\" stroke=\"transparent\" fill=\"black\"/>',l+=\"</svg>\"},f.createDataURL=function(t,r){t=t||2,r=void 0===r?4*t:r;var e=f.getModuleCount()*t+2*r,n=r,o=e-r;return I(e,e,(function(r,e){if(n<=r&&r<o&&n<=e&&e<o){var i=Math.floor((r-n)/t),a=Math.floor((e-n)/t);return f.isDark(a,i)?0:1}return 1}))},f.createImgTag=function(t,r,e){t=t||2,r=void 0===r?4*t:r;var n=f.getModuleCount()*t+2*r,o=\"\";return o+=\"<img\",o+=' src=\"',o+=f.createDataURL(t,r),o+='\"',o+=' width=\"',o+=n,o+='\"',o+=' height=\"',o+=n,o+='\"',e&&(o+=' alt=\"',o+=y(e),o+='\"'),o+=\"/>\"};var y=function(t){for(var r=\"\",e=0;e<t.length;e+=1){var n=t.charAt(e);switch(n){case\"<\":r+=\"&lt;\";break;case\">\":r+=\"&gt;\";break;case\"&\":r+=\"&amp;\";break;case'\"':r+=\"&quot;\";break;default:r+=n}}return r};return f.createASCII=function(t,r){if((t=t||1)<2)return function(t){t=void 0===t?2:t;var r,e,n,o,i,a=1*f.getModuleCount()+2*t,u=t,c=a-t,g={\"\u2588\u2588\":\"\u2588\",\"\u2588 \":\"\u2580\",\" \u2588\":\"\u2584\",\"  \":\" \"},l={\"\u2588\u2588\":\"\u2580\",\"\u2588 \":\"\u2580\",\" \u2588\":\" \",\"  \":\" \"},h=\"\";for(r=0;r<a;r+=2){for(n=Math.floor((r-u)/1),o=Math.floor((r+1-u)/1),e=0;e<a;e+=1)i=\"\u2588\",u<=e&&e<c&&u<=r&&r<c&&f.isDark(n,Math.floor((e-u)/1))&&(i=\" \"),u<=e&&e<c&&u<=r+1&&r+1<c&&f.isDark(o,Math.floor((e-u)/1))?i+=\" \":i+=\"\u2588\",h+=t<1&&r+1>=c?l[i]:g[i];h+=\"\\n\"}return a%2&&t>0?h.substring(0,h.length-a-1)+Array(a+1).join(\"\u2580\"):h.substring(0,h.length-1)}(r);t-=1,r=void 0===r?2*t:r;var e,n,o,i,a=f.getModuleCount()*t+2*r,u=r,c=a-r,g=Array(t+1).join(\"\u2588\u2588\"),l=Array(t+1).join(\"  \"),h=\"\",s=\"\";for(e=0;e<a;e+=1){for(o=Math.floor((e-u)/t),s=\"\",n=0;n<a;n+=1)i=1,u<=n&&n<c&&u<=e&&e<c&&f.isDark(o,Math.floor((n-u)/t))&&(i=0),s+=i?g:l;for(o=0;o<t;o+=1)h+=s+\"\\n\"}return h.substring(0,h.length-1)},f.renderTo2dContext=function(t,r){r=r||2;for(var e=f.getModuleCount(),n=0;n<e;n++)for(var o=0;o<e;o++)t.fillStyle=f.isDark(n,o)?\"black\":\"white\",t.fillRect(n*r,o*r,r,r)},f};t.stringToBytes=(t.stringToBytesFuncs={default:function(t){for(var r=[],e=0;e<t.length;e+=1){var n=t.charCodeAt(e);r.push(255&n)}return r}}).default,t.createStringToBytes=function(t,r){var e=function(){for(var e=S(t),n=function(){var t=e.read();if(-1==t)throw\"eof\";return t},o=0,i={};;){var a=e.read();if(-1==a)break;var u=n(),f=n()<<8|n();i[String.fromCharCode(a<<8|u)]=f,o+=1}if(o!=r)throw o+\" != \"+r;return i}(),n=\"?\".charCodeAt(0);return function(t){for(var r=[],o=0;o<t.length;o+=1){var i=t.charCodeAt(o);if(i<128)r.push(i);else{var a=e[t.charAt(o)];\"number\"==typeof a?(255&a)==a?r.push(a):(r.push(a>>>8),r.push(255&a)):r.push(n)}}return r}};var r,e,n,o,i,a=1,u=2,f=4,c=8,g={L:1,M:0,Q:3,H:2},l=0,h=1,s=2,v=3,d=4,w=5,p=6,y=7,B=(r=[[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50],[6,30,54],[6,32,58],[6,34,62],[6,26,46,66],[6,26,48,70],[6,26,50,74],[6,30,54,78],[6,30,56,82],[6,30,58,86],[6,34,62,90],[6,28,50,72,94],[6,26,50,74,98],[6,30,54,78,102],[6,28,54,80,106],[6,32,58,84,110],[6,30,58,86,114],[6,34,62,90,118],[6,26,50,74,98,122],[6,30,54,78,102,126],[6,26,52,78,104,130],[6,30,56,82,108,134],[6,34,60,86,112,138],[6,30,58,86,114,142],[6,34,62,90,118,146],[6,30,54,78,102,126,150],[6,24,50,76,102,128,154],[6,28,54,80,106,132,158],[6,32,58,84,110,136,162],[6,26,54,82,110,138,166],[6,30,58,86,114,142,170]],e=1335,n=7973,i=function(t){for(var r=0;0!=t;)r+=1,t>>>=1;return r},(o={}).getBCHTypeInfo=function(t){for(var r=t<<10;i(r)-i(e)>=0;)r^=e<<i(r)-i(e);return 21522^(t<<10|r)},o.getBCHTypeNumber=function(t){for(var r=t<<12;i(r)-i(n)>=0;)r^=n<<i(r)-i(n);return t<<12|r},o.getPatternPosition=function(t){return r[t-1]},o.getMaskFunction=function(t){switch(t){case l:return function(t,r){return(t+r)%2==0};case h:return function(t,r){return t%2==0};case s:return function(t,r){return r%3==0};case v:return function(t,r){return(t+r)%3==0};case d:return function(t,r){return(Math.floor(t/2)+Math.floor(r/3))%2==0};case w:return function(t,r){return t*r%2+t*r%3==0};case p:return function(t,r){return(t*r%2+t*r%3)%2==0};case y:return function(t,r){return(t*r%3+(t+r)%2)%2==0};default:throw\"bad maskPattern:\"+t}},o.getErrorCorrectPolynomial=function(t){for(var r=k([1],0),e=0;e<t;e+=1)r=r.multiply(k([1,C.gexp(e)],0));return r},o.getLengthInBits=function(t,r){if(1<=r&&r<10)switch(t){case a:return 10;case u:return 9;case f:case c:return 8;default:throw\"mode:\"+t}else if(r<27)switch(t){case a:return 12;case u:return 11;case f:return 16;case c:return 10;default:throw\"mode:\"+t}else{if(!(r<41))throw\"type:\"+r;switch(t){case a:return 14;case u:return 13;case f:return 16;case c:return 12;default:throw\"mode:\"+t}}},o.getLostPoint=function(t){for(var r=t.getModuleCount(),e=0,n=0;n<r;n+=1)for(var o=0;o<r;o+=1){for(var i=0,a=t.isDark(n,o),u=-1;u<=1;u+=1)if(!(n+u<0||r<=n+u))for(var f=-1;f<=1;f+=1)o+f<0||r<=o+f||0==u&&0==f||a==t.isDark(n+u,o+f)&&(i+=1);i>5&&(e+=3+i-5)}for(n=0;n<r-1;n+=1)for(o=0;o<r-1;o+=1){var c=0;t.isDark(n,o)&&(c+=1),t.isDark(n+1,o)&&(c+=1),t.isDark(n,o+1)&&(c+=1),t.isDark(n+1,o+1)&&(c+=1),0!=c&&4!=c||(e+=3)}for(n=0;n<r;n+=1)for(o=0;o<r-6;o+=1)t.isDark(n,o)&&!t.isDark(n,o+1)&&t.isDark(n,o+2)&&t.isDark(n,o+3)&&t.isDark(n,o+4)&&!t.isDark(n,o+5)&&t.isDark(n,o+6)&&(e+=40);for(o=0;o<r;o+=1)for(n=0;n<r-6;n+=1)t.isDark(n,o)&&!t.isDark(n+1,o)&&t.isDark(n+2,o)&&t.isDark(n+3,o)&&t.isDark(n+4,o)&&!t.isDark(n+5,o)&&t.isDark(n+6,o)&&(e+=40);var g=0;for(o=0;o<r;o+=1)for(n=0;n<r;n+=1)t.isDark(n,o)&&(g+=1);return e+=Math.abs(100*g/r/r-50)/5*10},o),C=function(){for(var t=new Array(256),r=new Array(256),e=0;e<8;e+=1)t[e]=1<<e;for(e=8;e<256;e+=1)t[e]=t[e-4]^t[e-5]^t[e-6]^t[e-8];for(e=0;e<255;e+=1)r[t[e]]=e;var n={glog:function(t){if(t<1)throw\"glog(\"+t+\")\";return r[t]},gexp:function(r){for(;r<0;)r+=255;for(;r>=256;)r-=255;return t[r]}};return n}();function k(t,r){if(void 0===t.length)throw t.length+\"/\"+r;var e=function(){for(var e=0;e<t.length&&0==t[e];)e+=1;for(var n=new Array(t.length-e+r),o=0;o<t.length-e;o+=1)n[o]=t[o+e];return n}(),n={getAt:function(t){return e[t]},getLength:function(){return e.length},multiply:function(t){for(var r=new Array(n.getLength()+t.getLength()-1),e=0;e<n.getLength();e+=1)for(var o=0;o<t.getLength();o+=1)r[e+o]^=C.gexp(C.glog(n.getAt(e))+C.glog(t.getAt(o)));return k(r,0)},mod:function(t){if(n.getLength()-t.getLength()<0)return n;for(var r=C.glog(n.getAt(0))-C.glog(t.getAt(0)),e=new Array(n.getLength()),o=0;o<n.getLength();o+=1)e[o]=n.getAt(o);for(o=0;o<t.getLength();o+=1)e[o]^=C.gexp(C.glog(t.getAt(o))+r);return k(e,0).mod(t)}};return n}var A=function(){var t=[[1,26,19],[1,26,16],[1,26,13],[1,26,9],[1,44,34],[1,44,28],[1,44,22],[1,44,16],[1,70,55],[1,70,44],[2,35,17],[2,35,13],[1,100,80],[2,50,32],[2,50,24],[4,25,9],[1,134,108],[2,67,43],[2,33,15,2,34,16],[2,33,11,2,34,12],[2,86,68],[4,43,27],[4,43,19],[4,43,15],[2,98,78],[4,49,31],[2,32,14,4,33,15],[4,39,13,1,40,14],[2,121,97],[2,60,38,2,61,39],[4,40,18,2,41,19],[4,40,14,2,41,15],[2,146,116],[3,58,36,2,59,37],[4,36,16,4,37,17],[4,36,12,4,37,13],[2,86,68,2,87,69],[4,69,43,1,70,44],[6,43,19,2,44,20],[6,43,15,2,44,16],[4,101,81],[1,80,50,4,81,51],[4,50,22,4,51,23],[3,36,12,8,37,13],[2,116,92,2,117,93],[6,58,36,2,59,37],[4,46,20,6,47,21],[7,42,14,4,43,15],[4,133,107],[8,59,37,1,60,38],[8,44,20,4,45,21],[12,33,11,4,34,12],[3,145,115,1,146,116],[4,64,40,5,65,41],[11,36,16,5,37,17],[11,36,12,5,37,13],[5,109,87,1,110,88],[5,65,41,5,66,42],[5,54,24,7,55,25],[11,36,12,7,37,13],[5,122,98,1,123,99],[7,73,45,3,74,46],[15,43,19,2,44,20],[3,45,15,13,46,16],[1,135,107,5,136,108],[10,74,46,1,75,47],[1,50,22,15,51,23],[2,42,14,17,43,15],[5,150,120,1,151,121],[9,69,43,4,70,44],[17,50,22,1,51,23],[2,42,14,19,43,15],[3,141,113,4,142,114],[3,70,44,11,71,45],[17,47,21,4,48,22],[9,39,13,16,40,14],[3,135,107,5,136,108],[3,67,41,13,68,42],[15,54,24,5,55,25],[15,43,15,10,44,16],[4,144,116,4,145,117],[17,68,42],[17,50,22,6,51,23],[19,46,16,6,47,17],[2,139,111,7,140,112],[17,74,46],[7,54,24,16,55,25],[34,37,13],[4,151,121,5,152,122],[4,75,47,14,76,48],[11,54,24,14,55,25],[16,45,15,14,46,16],[6,147,117,4,148,118],[6,73,45,14,74,46],[11,54,24,16,55,25],[30,46,16,2,47,17],[8,132,106,4,133,107],[8,75,47,13,76,48],[7,54,24,22,55,25],[22,45,15,13,46,16],[10,142,114,2,143,115],[19,74,46,4,75,47],[28,50,22,6,51,23],[33,46,16,4,47,17],[8,152,122,4,153,123],[22,73,45,3,74,46],[8,53,23,26,54,24],[12,45,15,28,46,16],[3,147,117,10,148,118],[3,73,45,23,74,46],[4,54,24,31,55,25],[11,45,15,31,46,16],[7,146,116,7,147,117],[21,73,45,7,74,46],[1,53,23,37,54,24],[19,45,15,26,46,16],[5,145,115,10,146,116],[19,75,47,10,76,48],[15,54,24,25,55,25],[23,45,15,25,46,16],[13,145,115,3,146,116],[2,74,46,29,75,47],[42,54,24,1,55,25],[23,45,15,28,46,16],[17,145,115],[10,74,46,23,75,47],[10,54,24,35,55,25],[19,45,15,35,46,16],[17,145,115,1,146,116],[14,74,46,21,75,47],[29,54,24,19,55,25],[11,45,15,46,46,16],[13,145,115,6,146,116],[14,74,46,23,75,47],[44,54,24,7,55,25],[59,46,16,1,47,17],[12,151,121,7,152,122],[12,75,47,26,76,48],[39,54,24,14,55,25],[22,45,15,41,46,16],[6,151,121,14,152,122],[6,75,47,34,76,48],[46,54,24,10,55,25],[2,45,15,64,46,16],[17,152,122,4,153,123],[29,74,46,14,75,47],[49,54,24,10,55,25],[24,45,15,46,46,16],[4,152,122,18,153,123],[13,74,46,32,75,47],[48,54,24,14,55,25],[42,45,15,32,46,16],[20,147,117,4,148,118],[40,75,47,7,76,48],[43,54,24,22,55,25],[10,45,15,67,46,16],[19,148,118,6,149,119],[18,75,47,31,76,48],[34,54,24,34,55,25],[20,45,15,61,46,16]],r=function(t,r){var e={};return e.totalCount=t,e.dataCount=r,e},e={};return e.getRSBlocks=function(e,n){var o=function(r,e){switch(e){case g.L:return t[4*(r-1)+0];case g.M:return t[4*(r-1)+1];case g.Q:return t[4*(r-1)+2];case g.H:return t[4*(r-1)+3];default:return}}(e,n);if(void 0===o)throw\"bad rs block @ typeNumber:\"+e+\"/errorCorrectionLevel:\"+n;for(var i=o.length/3,a=[],u=0;u<i;u+=1)for(var f=o[3*u+0],c=o[3*u+1],l=o[3*u+2],h=0;h<f;h+=1)a.push(r(c,l));return a},e}(),b=function(){var t=[],r=0,e={getBuffer:function(){return t},getAt:function(r){var e=Math.floor(r/8);return 1==(t[e]>>>7-r%8&1)},put:function(t,r){for(var n=0;n<r;n+=1)e.putBit(1==(t>>>r-n-1&1))},getLengthInBits:function(){return r},putBit:function(e){var n=Math.floor(r/8);t.length<=n&&t.push(0),e&&(t[n]|=128>>>r%8),r+=1}};return e},M=function(t){var r=a,e=t,n={getMode:function(){return r},getLength:function(t){return e.length},write:function(t){for(var r=e,n=0;n+2<r.length;)t.put(o(r.substring(n,n+3)),10),n+=3;n<r.length&&(r.length-n==1?t.put(o(r.substring(n,n+1)),4):r.length-n==2&&t.put(o(r.substring(n,n+2)),7))}},o=function(t){for(var r=0,e=0;e<t.length;e+=1)r=10*r+i(t.charAt(e));return r},i=function(t){if(\"0\"<=t&&t<=\"9\")return t.charCodeAt(0)-\"0\".charCodeAt(0);throw\"illegal char :\"+t};return n},x=function(t){var r=u,e=t,n={getMode:function(){return r},getLength:function(t){return e.length},write:function(t){for(var r=e,n=0;n+1<r.length;)t.put(45*o(r.charAt(n))+o(r.charAt(n+1)),11),n+=2;n<r.length&&t.put(o(r.charAt(n)),6)}},o=function(t){if(\"0\"<=t&&t<=\"9\")return t.charCodeAt(0)-\"0\".charCodeAt(0);if(\"A\"<=t&&t<=\"Z\")return t.charCodeAt(0)-\"A\".charCodeAt(0)+10;switch(t){case\" \":return 36;case\"$\":return 37;case\"%\":return 38;case\"*\":return 39;case\"+\":return 40;case\"-\":return 41;case\".\":return 42;case\"/\":return 43;case\":\":return 44;default:throw\"illegal char :\"+t}};return n},m=function(r){var e=f,n=t.stringToBytes(r),o={getMode:function(){return e},getLength:function(t){return n.length},write:function(t){for(var r=0;r<n.length;r+=1)t.put(n[r],8)}};return o},L=function(r){var e=c,n=t.stringToBytesFuncs.SJIS;if(!n)throw\"sjis not supported.\";!function(){var t=n(\"\u53cb\");if(2!=t.length||38726!=(t[0]<<8|t[1]))throw\"sjis not supported.\"}();var o=n(r),i={getMode:function(){return e},getLength:function(t){return~~(o.length/2)},write:function(t){for(var r=o,e=0;e+1<r.length;){var n=(255&r[e])<<8|255&r[e+1];if(33088<=n&&n<=40956)n-=33088;else{if(!(57408<=n&&n<=60351))throw\"illegal char at \"+(e+1)+\"/\"+n;n-=49472}n=192*(n>>>8&255)+(255&n),t.put(n,13),e+=2}if(e<r.length)throw\"illegal char at \"+(e+1)}};return i},D=function(){var t=[],r={writeByte:function(r){t.push(255&r)},writeShort:function(t){r.writeByte(t),r.writeByte(t>>>8)},writeBytes:function(t,e,n){e=e||0,n=n||t.length;for(var o=0;o<n;o+=1)r.writeByte(t[o+e])},writeString:function(t){for(var e=0;e<t.length;e+=1)r.writeByte(t.charCodeAt(e))},toByteArray:function(){return t},toString:function(){var r=\"\";r+=\"[\";for(var e=0;e<t.length;e+=1)e>0&&(r+=\",\"),r+=t[e];return r+=\"]\"}};return r},S=function(t){var r=t,e=0,n=0,o=0,i={read:function(){for(;o<8;){if(e>=r.length){if(0==o)return-1;throw\"unexpected end of file./\"+o}var t=r.charAt(e);if(e+=1,\"=\"==t)return o=0,-1;t.match(/^\\s$/)||(n=n<<6|a(t.charCodeAt(0)),o+=6)}var i=n>>>o-8&255;return o-=8,i}},a=function(t){if(65<=t&&t<=90)return t-65;if(97<=t&&t<=122)return t-97+26;if(48<=t&&t<=57)return t-48+52;if(43==t)return 62;if(47==t)return 63;throw\"c:\"+t};return i},I=function(t,r,e){for(var n=function(t,r){var e=t,n=r,o=new Array(t*r),i={setPixel:function(t,r,n){o[r*e+t]=n},write:function(t){t.writeString(\"GIF87a\"),t.writeShort(e),t.writeShort(n),t.writeByte(128),t.writeByte(0),t.writeByte(0),t.writeByte(0),t.writeByte(0),t.writeByte(0),t.writeByte(255),t.writeByte(255),t.writeByte(255),t.writeString(\",\"),t.writeShort(0),t.writeShort(0),t.writeShort(e),t.writeShort(n),t.writeByte(0);var r=a(2);t.writeByte(2);for(var o=0;r.length-o>255;)t.writeByte(255),t.writeBytes(r,o,255),o+=255;t.writeByte(r.length-o),t.writeBytes(r,o,r.length-o),t.writeByte(0),t.writeString(\";\")}},a=function(t){for(var r=1<<t,e=1+(1<<t),n=t+1,i=u(),a=0;a<r;a+=1)i.add(String.fromCharCode(a));i.add(String.fromCharCode(r)),i.add(String.fromCharCode(e));var f,c,g,l=D(),h=(f=l,c=0,g=0,{write:function(t,r){if(t>>>r!=0)throw\"length over\";for(;c+r>=8;)f.writeByte(255&(t<<c|g)),r-=8-c,t>>>=8-c,g=0,c=0;g|=t<<c,c+=r},flush:function(){c>0&&f.writeByte(g)}});h.write(r,n);var s=0,v=String.fromCharCode(o[s]);for(s+=1;s<o.length;){var d=String.fromCharCode(o[s]);s+=1,i.contains(v+d)?v+=d:(h.write(i.indexOf(v),n),i.size()<4095&&(i.size()==1<<n&&(n+=1),i.add(v+d)),v=d)}return h.write(i.indexOf(v),n),h.write(e,n),h.flush(),l.toByteArray()},u=function(){var t={},r=0,e={add:function(n){if(e.contains(n))throw\"dup key:\"+n;t[n]=r,r+=1},size:function(){return r},indexOf:function(r){return t[r]},contains:function(r){return void 0!==t[r]}};return e};return i}(t,r),o=0;o<r;o+=1)for(var i=0;i<t;i+=1)n.setPixel(i,o,e(i,o));var a=D();n.write(a);for(var u=function(){var t=0,r=0,e=0,n=\"\",o={},i=function(t){n+=String.fromCharCode(a(63&t))},a=function(t){if(t<0);else{if(t<26)return 65+t;if(t<52)return t-26+97;if(t<62)return t-52+48;if(62==t)return 43;if(63==t)return 47}throw\"n:\"+t};return o.writeByte=function(n){for(t=t<<8|255&n,r+=8,e+=1;r>=6;)i(t>>>r-6),r-=6},o.flush=function(){if(r>0&&(i(t<<6-r),t=0,r=0),e%3!=0)for(var o=3-e%3,a=0;a<o;a+=1)n+=\"=\"},o.toString=function(){return n},o}(),f=a.toByteArray(),c=0;c<f.length;c+=1)u.writeByte(f[c]);return u.flush(),\"data:image/gif;base64,\"+u};return t}();qrcode.stringToBytesFuncs[\"UTF-8\"]=function(t){return function(t){for(var r=[],e=0;e<t.length;e++){var n=t.charCodeAt(e);n<128?r.push(n):n<2048?r.push(192|n>>6,128|63&n):n<55296||n>=57344?r.push(224|n>>12,128|n>>6&63,128|63&n):(e++,n=65536+((1023&n)<<10|1023&t.charCodeAt(e)),r.push(240|n>>18,128|n>>12&63,128|n>>6&63,128|63&n))}return r}(t)},function(t){\"function\"==typeof define&&define.amd?define([],t):\"object\"==typeof exports&&(module.exports=t())}((function(){return qrcode}));\n";
-
-function userPanelEscapeHtml(s) {
-    return String(s == null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-function userPanelBuildAppLinks(subUrl) {
-    // Deep links for one-click import into popular clients.
-    // subUrl must be the full https subscription URL for THIS user.
-    const b64 = btoa(subUrl);
-    return {
-        happ: 'happ://add/' + b64,
-        happ_crypto: 'happ://crypto?internet=1&url=' + b64,
-        v2raytun: 'v2raytun://import/' + b64,
-        streisand: 'streisand://import/' + subUrl,
-        hiddify: 'hiddify://import/' + subUrl,
-        npv: 'npv2://import/' + b64,
-        v2box: 'v2box://install-config?url=' + subUrl
-    };
-}
-
-async function userPanelFetchData(env, user) {
-    // Assembles everything the panel shows from D1 for one user row.
-    const uid = user.id;
-    const maxBW = user.max_bandwidth_bytes || (user.max_bandwidth_mb || 0) * 1024 * 1024;
-    const usedBW = user.used_bandwidth_bytes || 0;
-
-    // Daily usage, last 7 days (Tehran day key, same convention as tracking)
-    let daily = [];
-    try {
-        const r = await env.DB.prepare(
-            'SELECT date, bytes_up, bytes_down, total_bytes, request_count FROM bandwidth_usage WHERE user_id = ? ORDER BY date DESC LIMIT 7'
-        ).bind(uid).all();
-        daily = (r.results || []).slice().reverse();
-    } catch (e) { /* ignore */ }
-
-    // Clean IPs
-    let cleanIPs = [];
-    try {
-        const r = await env.DB.prepare('SELECT name, ip, port, sni, note FROM clean_ips WHERE is_active = 1 ORDER BY sort_order ASC, id ASC').all();
-        cleanIPs = r.results || [];
-    } catch (e) { /* ignore */ }
-
-    // Recent connections (masked to subnet — panel is user-facing)
-    let recentConns = [];
-    try {
-        const r = await env.DB.prepare(
-            "SELECT event_type, protocol, details, created_at FROM connection_logs WHERE user_id = ? ORDER BY id DESC LIMIT 8"
-        ).bind(uid).all();
-        recentConns = r.results || [];
-    } catch (e) { /* ignore */ }
-
-    // Online devices (distinct subnets in the 5-min window, same as counter)
-    let devices = 0;
-    try {
-        const r = await env.DB.prepare(
-            "SELECT COUNT(DISTINCT subnet) AS c FROM active_connections WHERE user_id = ? AND last_activity >= datetime('now', '-5 minutes')"
-        ).bind(uid).first();
-        devices = r?.c || 0;
-    } catch (e) { /* ignore */ }
-
-    return { maxBW, usedBW, daily, cleanIPs, recentConns, devices };
-}
-
-function userPanelFormatBytes(b) {
-    if (!b || b <= 0) return '0 B';
-    const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.min(Math.floor(Math.log(b) / Math.log(k)), sizes.length - 1);
-    return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
-function userPanelHTML(data) {
-    const esc = userPanelEscapeHtml;
-    const fmt = userPanelFormatBytes;
-    const u = data.user;
-    const appLinks = data.appLinks;
-    const maxBW = data.maxBW;
-    const usedBW = data.usedBW;
-    const percent = maxBW > 0 ? Math.min(100, Math.round((usedBW / maxBW) * 100)) : 0;
-    const bwClass = percent >= 90 ? 'danger' : percent >= 70 ? 'warning' : '';
-    const expired = u.expires_at && u.expires_at <= data.now;
-    const frozen = u.is_frozen === 1;
-    const active = u.is_active === 1 && !expired && !frozen;
-    const daysLeft = u.expires_at
-        ? Math.max(0, Math.ceil((new Date(u.expires_at.replace(' ', 'T') + 'Z').getTime() - Date.now()) / 86400000))
-        : null;
-    const protocols = data.protocols;
-
-    // Build node list client-side data (JSON, injected safely)
-    const nodes = [];
-    if (protocols.vless !== false || protocols.trojan !== false) {
-        for (const port of ['443', '2053', '2096']) {
-            if (protocols.vless !== false) nodes.push({ name: 'VLESS · CDN · ' + port, link: data.linkBase.replace('%PROTO%', 'vless').replace('%PORT%', port).replace('%SNI%', data.host).replace('%HOST%', data.host) });
-            if (protocols.trojan !== false) nodes.push({ name: 'Trojan · CDN · ' + port, link: data.linkBase.replace('%PROTO%', 'trojan').replace('%PORT%', port).replace('%SNI%', data.host).replace('%HOST%', data.host) });
-        }
-    }
-    for (const c of data.cleanIPs) {
-        const cHost = c.ip || data.host, cPort = c.port || 443, cSni = c.sni || data.host;
-        if (protocols.vless !== false) nodes.push({ name: 'VLESS · ' + c.name + ' · ' + cPort, link: data.linkBase.replace('%PROTO%', 'vless').replace('%PORT%', String(cPort)).replace('%SNI%', cSni).replace('%HOST%', cHost) });
-        if (protocols.trojan !== false) nodes.push({ name: 'Trojan · ' + c.name + ' · ' + cPort, link: data.linkBase.replace('%PROTO%', 'trojan').replace('%PORT%', String(cPort)).replace('%SNI%', cSni).replace('%HOST%', cHost) });
-    }
-
-    const maxDaily = Math.max(1, ...data.daily.map(d => d.total_bytes || 0));
-
-    return `<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta name="theme-color" content="#0a0e1a">
-<title>ShadowVPN — پنل کاربری</title>
-<style>
-:root{--bg:#0a0e1a;--bg2:#111827;--tx:#f1f5f9;--tx2:#94a3b8;--tx3:#64748b;--ac:#38bdf8;--ac2:#818cf8;--ok:#34d399;--wn:#fbbf24;--dg:#f87171;--bd:rgba(148,163,184,.14);--bd2:rgba(148,163,184,.28);--glass:rgba(17,24,39,.66);--r:14px;--rs:9px;--sh:0 10px 40px -12px rgba(0,0,0,.55);--glow:0 0 24px -6px rgba(56,189,248,.45)}
-*{margin:0;padding:0;box-sizing:border-box}
-html{scrollbar-color:rgba(148,163,184,.3) transparent}
-::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:rgba(148,163,184,.25);border-radius:8px}
-body{font-family:'Segoe UI',Tahoma,sans-serif;color:var(--tx);min-height:100vh;background:radial-gradient(1100px 520px at 82% -8%,rgba(56,189,248,.17),transparent 62%),radial-gradient(880px 500px at 6% 14%,rgba(52,211,153,.08),transparent 60%),radial-gradient(950px 480px at 12% 108%,rgba(129,140,248,.15),transparent 60%),radial-gradient(700px 420px at 95% 70%,rgba(56,189,248,.06),transparent 60%),radial-gradient(rgba(148,163,184,.05) 1px,transparent 1.4px),linear-gradient(160deg,#0a0e1a,#0d1530 48%,#090d18);background-size:auto,auto,auto,auto,26px 26px,auto;background-attachment:fixed}
-@keyframes up{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
-.wrap{max-width:760px;margin:0 auto;padding:1.2rem 1rem 3rem;position:relative;z-index:1}
-.hero{text-align:center;padding:1.6rem .5rem 1.2rem;animation:up .45s ease both}
-.hero h1{font-size:1.3rem;font-weight:800;background:linear-gradient(120deg,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;display:inline-flex;align-items:center;gap:.5rem}
-.hero h1 svg{width:1.6em;height:1.6em;-webkit-text-fill-color:initial}
-.hero .sub{color:var(--tx2);font-size:.85rem;margin-top:.3rem}
-.badge{display:inline-flex;align-items:center;gap:.35rem;padding:.3rem .75rem;border-radius:999px;font-size:.78rem;font-weight:700;margin-top:.7rem}
-.b-ok{background:rgba(52,211,153,.14);color:var(--ok);border:1px solid rgba(52,211,153,.35)}
-.b-no{background:rgba(248,113,113,.14);color:var(--dg);border:1px solid rgba(248,113,113,.35)}
-.b-wn{background:rgba(251,191,36,.14);color:var(--wn);border:1px solid rgba(251,191,36,.35)}
-.card{background:linear-gradient(165deg,rgba(28,38,66,.72),rgba(13,18,36,.60) 55%,rgba(13,18,36,.68));backdrop-filter:blur(20px) saturate(1.35);-webkit-backdrop-filter:blur(20px) saturate(1.35);border:1px solid var(--bd);border-radius:var(--r);box-shadow:var(--sh),inset 0 1px 0 rgba(255,255,255,.07),inset 0 -14px 26px -20px rgba(56,189,248,.28);padding:1.25rem;margin-bottom:1rem;animation:up .45s ease both}
-.card h2{font-size:.95rem;font-weight:700;color:var(--tx2);margin-bottom:1rem;display:flex;align-items:center;gap:.5rem}
-.card h2 svg{width:1.15em;height:1.15em;color:var(--ac)}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:.7rem}
-@media(min-width:560px){.grid{grid-template-columns:repeat(3,1fr)}}
-.cell{background:linear-gradient(170deg,rgba(35,48,80,.55),rgba(10,14,26,.68));border:1px solid var(--bd);border-radius:var(--rs);padding:.8rem;text-align:center;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 6px 18px -10px rgba(0,0,0,.6)}
-.cell h4{color:var(--tx3);font-size:.7rem;font-weight:600;margin-bottom:.4rem}
-.cell .v{color:var(--ac);font-weight:800;font-size:1.05rem;font-variant-numeric:tabular-nums}
-.cell .v.ok{color:var(--ok)}.cell .v.wn{color:var(--wn)}.cell .v.dg{color:var(--dg)}
-.progress{height:8px;background:rgba(148,163,184,.14);border-radius:999px;overflow:hidden;margin-top:.8rem}
-.pbar{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--ac),var(--ac2));box-shadow:0 0 10px -2px rgba(56,189,248,.7);transition:width .4s ease}
-.pbar.warning{background:linear-gradient(90deg,#fbbf24,#f59e0b);box-shadow:0 0 10px -2px rgba(251,191,36,.7)}
-.pbar.danger{background:linear-gradient(90deg,#f87171,#ef4444);box-shadow:0 0 10px -2px rgba(248,113,113,.7)}
-.plabel{text-align:center;font-size:.75rem;color:var(--tx2);margin-top:.4rem}
-.chart{display:flex;align-items:flex-end;gap:6px;height:110px;margin-top:.5rem}
-.bar{flex:1;background:linear-gradient(180deg,var(--ac),rgba(129,140,248,.5));border-radius:6px 6px 2px 2px;min-height:3px;position:relative;opacity:.85}
-.bar:hover{opacity:1}
-.bar span{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);font-size:.6rem;color:var(--tx3);white-space:nowrap;opacity:0;transition:opacity .2s}
-.bar:hover span{opacity:1}
-.xlab{display:flex;gap:6px;margin-top:.35rem}
-.xlab div{flex:1;text-align:center;font-size:.62rem;color:var(--tx3)}
-.subbox{background:linear-gradient(170deg,rgba(30,44,74,.75),rgba(10,14,26,.85));border:1px solid var(--bd);border-radius:var(--rs);padding:.75rem;font-family:ui-monospace,monospace;font-size:.72rem;word-break:break-all;color:#a5f3fc;direction:ltr;text-align:left;box-shadow:inset 0 1px 0 rgba(255,255,255,.07),inset 0 0 24px -10px rgba(56,189,248,.45)}
-@property --beam{syntax:'<angle>';initial-value:0deg;inherits:false}
-.beam{position:relative;transition:transform .15s ease}
-.beam::before{content:'';position:absolute;inset:-2px;border-radius:12px;padding:2px;background:conic-gradient(from var(--beam),transparent 0deg,transparent 248deg,#38bdf8 288deg,#818cf8 308deg,#34d399 328deg,transparent 360deg);-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);mask-composite:exclude;animation:beamspin 3.6s linear infinite,beampulse 3.6s ease-in-out infinite;pointer-events:none}
-#subLink{cursor:pointer}
-#subLink:active{transform:scale(.985)}
-.beam.card{cursor:default}
-.beam.card::before{border-radius:16px}
-.wrap>.card.beam:nth-of-type(even)::before{animation-delay:-1.8s}
-@keyframes beampulse{0%,100%{opacity:.55}22%{opacity:1}45%{opacity:.6}}
-.appsframe{position:relative;border-radius:16px}
-.appsframe::before{content:'';position:absolute;inset:-2px;border-radius:18px;padding:1px;background:linear-gradient(135deg,rgba(56,189,248,.30),rgba(129,140,248,.30));-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);mask-composite:exclude;pointer-events:none}
-@keyframes beamspin{to{--beam:360deg}}
-@media (prefers-reduced-motion:reduce){.beam::before{animation:none}}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;padding:.55rem 1rem;border:1px solid var(--bd);border-radius:10px;cursor:pointer;font-size:.83rem;font-weight:600;color:var(--tx);background:rgba(31,41,55,.6);transition:transform .15s,box-shadow .2s,filter .2s;margin:.15rem}
-.btn:hover{transform:translateY(-1px)}
-.btn-p{background:linear-gradient(135deg,rgba(56,189,248,.9),rgba(129,140,248,.9));color:#071018;border:none;box-shadow:var(--glow)}
-.btn-p:hover{filter:brightness(1.1)}
-.btn-o{background:transparent}
-.btn svg{width:1.05em;height:1.05em;flex-shrink:0}
-.apps{display:grid;grid-template-columns:repeat(2,1fr);gap:.5rem}
-@media(min-width:480px){.apps{grid-template-columns:repeat(3,1fr)}}
-.app-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.25rem;padding:.8rem .5rem;border-radius:12px;cursor:pointer;text-decoration:none;color:var(--tx);background:rgba(148,163,184,.08);backdrop-filter:blur(10px) saturate(1.2);-webkit-backdrop-filter:blur(10px) saturate(1.2);border:1px solid var(--bd);transition:background .25s,color .25s,border-color .25s,box-shadow .25s,transform .15s}
-.app-btn:hover{background:linear-gradient(135deg,rgba(56,189,248,.9),rgba(129,140,248,.9));color:#071018;border-color:transparent;box-shadow:0 0 26px -6px rgba(56,189,248,.65);transform:translateY(-2px)}
-.app-btn:active{transform:translateY(0)}
-.node{background:linear-gradient(170deg,rgba(35,48,80,.55),rgba(10,14,26,.68));border:1px solid var(--bd);border-radius:var(--rs);padding:.7rem .8rem;margin-bottom:.55rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 6px 18px -10px rgba(0,0,0,.6)}
-.node .row{display:flex;justify-content:space-between;align-items:center;gap:.5rem}
-.node .nm{color:var(--ac);font-weight:700;font-size:.82rem}
-.node .lk{font-family:ui-monospace,monospace;font-size:.62rem;color:var(--tx3);word-break:break-all;margin-top:.35rem;max-height:2.4em;overflow:hidden;direction:ltr;text-align:left}
-.node .acts{display:flex;gap:.3rem;flex-shrink:0}
-.btn-xs{padding:.3rem .5rem;font-size:.72rem;border-radius:8px}
-.modal{display:none;position:fixed;inset:0;background:rgba(4,8,16,.78);backdrop-filter:blur(6px);z-index:100;justify-content:center;align-items:center;padding:1rem}
-.modal.active{display:flex}
-.mbox{background:var(--bg2);border:1px solid var(--bd2);border-radius:18px;padding:1.4rem;max-width:420px;width:100%;text-align:center;box-shadow:var(--sh),var(--glow);animation:up .28s ease both}
-.mbox h3{font-size:.95rem;margin-bottom:.9rem;color:var(--tx)}
-.qrbox{background:#fff;border-radius:12px;padding:10px;display:inline-block;margin-bottom:.9rem}
-.qrbox svg{display:block;width:min(260px,70vw);height:auto}
-.mlink{background:linear-gradient(170deg,rgba(30,44,74,.7),rgba(10,14,26,.85));border:1px solid var(--bd);border-radius:8px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06);padding:.55rem;font-family:ui-monospace,monospace;font-size:.66rem;word-break:break-all;color:#a5f3fc;direction:ltr;text-align:left;margin-bottom:.9rem;max-height:80px;overflow-y:auto}
-.logrow{display:flex;justify-content:space-between;padding:.45rem 0;border-bottom:1px solid var(--bd);font-size:.78rem}
-.logrow:last-child{border-bottom:none}
-.logrow .t{color:var(--tx3);font-variant-numeric:tabular-nums}
-.dot{width:.55em;height:.55em;border-radius:50%;display:inline-block;margin-inline-end:.4em;vertical-align:middle}
-.toast{position:fixed;bottom:1.2rem;left:50%;transform:translateX(-50%) translateY(80px);background:var(--bg2);border:1px solid var(--ac);color:var(--ac);padding:.6rem 1.2rem;border-radius:999px;font-size:.85rem;font-weight:700;transition:transform .3s ease;z-index:200;box-shadow:var(--sh)}
-.toast.show{transform:translateX(-50%) translateY(0)}
-.foot{text-align:center;color:var(--tx3);font-size:.72rem;padding:1rem 0 .5rem}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="hero">
-    <h1><svg viewBox="0 0 24 24" class="logo"><path d="M12 2 L20 5.5 V11 C20 16.5 16.6 20.6 12 22 C7.4 20.6 4 16.5 4 11 V5.5 Z" fill="none" stroke="url(#none)" stroke-width="2"/></svg><span>ShadowVPN</span></h1>
-    <div class="sub">پنل کاربری — ${esc(u.username || 'کاربر')}</div>
-    ${active ? '<span class="badge b-ok">● اشتراک فعال</span>' : frozen ? '<span class="badge b-wn">● موقتاً غیرفعال (فریز)</span>' : expired ? '<span class="badge b-no">● اشتراک منقضی شده</span>' : '<span class="badge b-no">● اشتراک غیرفعال</span>'}
-  </div>
-
-  <div class="card beam" style="animation-delay:.05s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 15v-4"/><path d="M12 15V7"/><path d="M17 15v-6"/></svg>وضعیت مصرف</h2>
-    <div class="grid">
-      <div class="cell"><h4>حجم مصرف شده</h4><div class="v">${fmt(usedBW)}${maxBW > 0 ? ' <small style="color:var(--tx3);font-size:.65em">/ ' + fmt(maxBW) + '</small>' : ''}</div></div>
-      <div class="cell"><h4>درصد مصرف</h4><div class="v ${bwClass}">${maxBW > 0 ? percent + '%' : 'نامحدود'}</div></div>
-      <div class="cell"><h4>تاریخ انقضا</h4><div class="v">${u.expires_at ? u.expires_at.split(' ')[0] : '∞'}</div></div>
-      <div class="cell"><h4>روز باقی‌مانده</h4><div class="v ${daysLeft !== null && daysLeft <= 3 ? 'dg' : ''}">${daysLeft !== null ? daysLeft + ' روز' : 'نامحدود'}</div></div>
-      <div class="cell"><h4>دستگاه آنلاین</h4><div class="v ${data.devices >= (u.max_connections || 0) && (u.max_connections || 0) > 0 ? 'dg' : 'ok'}">${data.devices}${(u.max_connections || 0) > 0 ? ' <small style="color:var(--tx3);font-size:.65em">/ ' + u.max_connections + '</small>' : ''}</div></div>
-      <div class="cell"><h4>کل درخواست‌ها</h4><div class="v">${(u.total_requests || 0).toLocaleString('fa-IR')}</div></div>
-    </div>
-    ${maxBW > 0 ? '<div class="progress"><div class="pbar ' + bwClass + '" style="width:' + percent + '%"></div></div><div class="plabel">' + percent + '% از حجم اشتراک مصرف شده</div>' : ''}
-  </div>
-
-  <div class="card beam" style="animation-delay:.1s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>اشتراک</h2>
-    <div class="subbox beam" id="subLink" onclick="copySub()" title="بزن تا کپی شود">${esc(data.subUrl)}</div>
-    <div style="display:flex;flex-wrap:wrap;margin-top:.7rem;justify-content:center">
-      <button class="btn btn-p" onclick="copySub()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>کپی لینک اشتراک</button>
-      <button class="btn" onclick="showQR('sub', 'لینک اشتراک')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3z"/><path d="M21 14v3h-3"/><path d="M14 21h3"/><path d="M21 21h.01"/></svg>QR اشتراک</button>
-    </div>
-  </div>
-
-  <div class="card beam" style="animation-delay:.12s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12Z"/></svg>افزودن خودکار به اپلیکیشن</h2>
-    <div style="font-size:.75rem;color:var(--tx2);margin-bottom:.8rem;text-align:center;line-height:1.7">اپ موردنظر را روی گوشی نصب دارید؟ روی دکمه‌اش بزنید — اپ باز می‌شود و اشتراک <b>خودکار</b> اضافه می‌شود.</div>
-    <div class="apps appsframe">
-      <a class="app-btn" href="${esc(appLinks.happ)}"><span style="font-size:1.05rem;font-weight:800">Happ</span><span style="font-size:.68rem;opacity:.7">اندروید · iOS · ویندوز</span></a>
-      <a class="app-btn" href="${esc(appLinks.v2raytun)}"><span style="font-size:1.05rem;font-weight:800">v2rayNG / Tun</span><span style="font-size:.68rem;opacity:.7">اندروید</span></a>
-      <a class="app-btn" href="${esc(appLinks.hiddify)}"><span style="font-size:1.05rem;font-weight:800">Hiddify</span><span style="font-size:.68rem;opacity:.7">اندروید · iOS · دسکتاپ</span></a>
-      <a class="app-btn" href="${esc(appLinks.streisand)}"><span style="font-size:1.05rem;font-weight:800">Streisand</span><span style="font-size:.68rem;opacity:.7">iOS</span></a>
-      <a class="app-btn" href="${esc(appLinks.v2box)}"><span style="font-size:1.05rem;font-weight:800">V2Box</span><span style="font-size:.68rem;opacity:.7">اندروید · iOS</span></a>
-      <a class="app-btn" href="${esc(appLinks.npv)}"><span style="font-size:1.05rem;font-weight:800">NekoBox / NPV</span><span style="font-size:.68rem;opacity:.7">اندروید</span></a>
-      <button class="app-btn" onclick="showQR('sub', 'اسکن با اپ')"><span style="font-size:1.05rem;font-weight:800">سایر اپ‌ها</span><span style="font-size:.68rem;opacity:.7">اسکن QR داخل اپ</span></button>
-    </div>
-    <div style="font-size:.72rem;color:var(--tx3);margin-top:.7rem;text-align:center">اگر اپ باز نشد، دکمه QR را بزنید و کد را با اسکنر داخل اپ بخوانید.</div>
-  </div>
-
-  <div class="card beam" style="animation-delay:.15s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8.2 12 3 3 8.2v7.6L12 21l9-5.2Z"/><path d="M3 8.2 12 13.4l9-5.2"/><path d="M12 13.4V21"/></svg>کانفیگ‌ها (${nodes.length})</h2>
-    <div id="nodes">
-${nodes.map((n, i) => '      <div class="node"><div class="row"><span class="nm">' + esc(n.name) + '</span><span class="acts"><button class="btn btn-o btn-xs" onclick="copyNode(' + i + ')">کپی</button><button class="btn btn-o btn-xs" onclick="showQR(' + "'" + 'n' + i + "'" + ', ' + "'" + esc(n.name).replace(/'/g, "\\'") + "'" + ')">QR</button></span></div><div class="lk">' + esc(n.link) + '</div></div>').join('\n')}
-    </div>
-    <div style="display:flex;flex-wrap:wrap;margin-top:.7rem;justify-content:center">
-      <button class="btn btn-p" onclick="copyAllNodes()">کپی همه کانفیگ‌ها</button>
-      <a class="btn" id="dlBtn" download="configs.txt" onclick="downloadNodes()">دانلود فایل</a>
-    </div>
-  </div>
-
-  ${data.daily.length > 0 ? `<div class="card beam" style="animation-delay:.2s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 15v-4"/><path d="M12 15V7"/><path d="M17 15v-6"/></svg>مصرف هفت روز اخیر</h2>
-    <div class="chart">${data.daily.map(d => '<div class="bar" style="height:' + Math.max(3, Math.round(((d.total_bytes || 0) / maxDaily) * 100)) + '%"><span>' + fmt(d.total_bytes || 0) + '</span></div>').join('')}</div>
-    <div class="xlab">${data.daily.map(d => '<div>' + d.date.slice(5) + '</div>').join('')}</div>
-  </div>` : ''}
-
-  <div class="card beam" style="animation-delay:.25s">
-    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3.5 6h.01"/><path d="M3.5 12h.01"/><path d="M3.5 18h.01"/></svg>آخرین فعالیت</h2>
-    ${data.recentConns.length === 0 ? '<div style="color:var(--tx3);font-size:.8rem">فعالیتی ثبت نشده</div>' : data.recentConns.map(l => {
-        const okc = l.event_type === 'connect' ? 'var(--ok)' : 'var(--dg)';
-        return '<div class="logrow"><span><span class="dot" style="background:' + okc + '"></span>' + (l.event_type === 'connect' ? 'اتصال جدید' : 'قطع اتصال') + (l.protocol ? ' · ' + esc(l.protocol) : '') + '</span><span class="t">' + esc((l.created_at || '').slice(0, 16)) + '</span></div>';
-    }).join('')}
-  </div>
-
-  <div class="foot">ShadowVPN — اشتراک شما محرمانه است؛ آن را با کسی به اشتراک نگذارید.</div>
-</div>
-
-<div class="modal" id="qrModal">
-  <div class="mbox">
-    <h3 id="qrTitle">QR</h3>
-    <div class="qrbox" id="qrBox"></div>
-    <div class="mlink" id="qrLink">-</div>
-    <button class="btn btn-p" onclick="copyShown()">کپی محتوا</button>
-    <button class="btn" onclick="hideQR()">بستن</button>
-  </div>
-</div>
-<div class="toast" id="toast">کپی شد ✓</div>
-
-<script>
-var QR_LIB = ${data.qrLib};
-eval(QR_LIB);
-var _nodes = ${JSON.stringify(nodes)};
-var _subUrl = ${JSON.stringify(data.subUrl)};
-var _shown = '';
-function makeQR(text){
-  try{
-    var qr = qrcode(0, 'M');
-    qr.addData(text); qr.make();
-    return qr.createSvgTag({cellSize:4, margin:1});
-  }catch(e){ return '<div style="color:#111;font-size:12px">متن برای QR طولانی است</div>'; }
-}
-function showQR(key, title){
-  var text = key === 'sub' ? _subUrl : (_nodes[Number(key.slice(1))] || {}).link || '';
-  _shown = text;
-  document.getElementById('qrTitle').textContent = title || 'QR';
-  document.getElementById('qrBox').innerHTML = makeQR(text);
-  document.getElementById('qrLink').textContent = text;
-  document.getElementById('qrModal').classList.add('active');
-}
-function hideQR(){ document.getElementById('qrModal').classList.remove('active'); }
-document.getElementById('qrModal').addEventListener('click', function(e){ if(e.target === this) hideQR(); });
-function copyText(t, msg){
-  var done = function(){ toast(msg || 'کپی شد ✓'); };
-  if(navigator.clipboard && window.isSecureContext){ navigator.clipboard.writeText(t).then(done).catch(function(){ fb(t, done); }); }
-  else fb(t, done);
-  function fb(txt, cb){ var ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); cb(); }
-}
-function copySub(){ copyText(_subUrl); }
-function copyNode(i){ copyText(_nodes[i].link); }
-function copyAllNodes(){ copyText(_nodes.map(function(n){return n.link;}).join('\\n')); }
-function downloadNodes(){
-  var blob = new Blob([_nodes.map(function(n){return n.link;}).join('\\n')], {type:'text/plain'});
-  var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'configs.txt'; a.click();
-}
-function copyShown(){ copyText(_shown); }
-function toast(m){ var t=document.getElementById('toast'); t.textContent=m; t.classList.add('show'); setTimeout(function(){t.classList.remove('show');}, 1600); }
-</script>
 </body>
 </html>`;
 }
@@ -4714,7 +3881,7 @@ async function processNotifications(env) {
 async function runMigrations(env) {
     if (!env.DB) return;
 
-    const MIGRATION_VERSION = 8;
+    const MIGRATION_VERSION = 7;
     const currentVersion = await getMigrationVersion(env);
 
     if (currentVersion >= MIGRATION_VERSION) return;
@@ -4739,9 +3906,6 @@ async function runMigrations(env) {
         }
         if (currentVersion < 7) {
             await migrateToV7(env);
-        }
-        if (currentVersion < 8) {
-            await migrateToV8(env);
         }
 
         await setMigrationVersion(env, MIGRATION_VERSION);
@@ -5336,32 +4500,6 @@ async function migrateToV7(env) {
     console.log('[Migration] v7 migration completed');
 }
 
-async function migrateToV8(env) {
-    console.log('[Migration] Running v8 migration...');
-
-    // Device-grained tracking: legacy per-socket rows (one row per WebSocket with a
-    // random-UUID connection_id) don't match the new `user_id:subnet` device keys and
-    // inflate counts. Purge them — fresh device rows are created on the next connect.
-    try {
-        await env.DB.exec(
-            "DELETE FROM active_connections WHERE connection_id NOT LIKE '%:%'"
-        );
-        console.log('[Migration] v8 purged legacy per-socket rows');
-    } catch (e) {
-        console.error(`[Migration] v8 purge error: ${e.message}`);
-    }
-    try {
-        await env.DB.exec(
-            'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes"))'
-        );
-        console.log('[Migration] v8 resynced current_connections');
-    } catch (e) {
-        console.error(`[Migration] v8 resync error: ${e.message}`);
-    }
-
-    console.log('[Migration] v8 migration completed');
-}
-
 
 export default {
 	async fetch(request, env, ctx) {
@@ -5452,6 +4590,8 @@ export default {
 			}
 		} else if (管理员密码 && isWebSocket) {// WebSocket代理
 			try {
+			// TEMP: Return immediately to test if crash is here
+			if (url.pathname === '/__test__') return new Response('test ok');
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url, 反代上下文, env, ctx);
@@ -5929,11 +5069,6 @@ export default {
 			return 反代响应;
 		} catch (error) { }
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
-	},
-
-	// REAL cron handler (the `scheduled` near EOF is decoy text inside html1101's template literal — do not trust it)
-	async scheduled(event, env, ctx) {
-		ctx.waitUntil(handleCron(env));
 	}
 };
 ///////////////////////////////////////////////////////////////////////XHTTP传输数据///////////////////////////////////////////////
@@ -5953,7 +5088,7 @@ async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}, env = 
 	let xhttpBytesUp = 0;
 	let xhttpBytesDown = 0;
 	let xhttpMatchedUUID = null;
-	const XHTTP_BW_CHECK_INTERVAL = 25 * 1024 * 1024; // per-request sampling rate; D1 write cadence is buffer-controlled (100MB/5min, see flushBandwidth)
+	const XHTTP_BW_CHECK_INTERVAL = 1024 * 1024; // 1MB
 	const trackXHTTPBandwidthUp = (chunkSize) => {
 		xhttpBytesUp += (chunkSize || 0);
 		if (xhttpBytesUp + xhttpBytesDown >= XHTTP_BW_CHECK_INTERVAL) {
@@ -6071,12 +5206,11 @@ async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}, env = 
 	void 上行Promise.catch(清理);
 	void 下行Promise.then(() => 清理(), 清理);
 	void Promise.allSettled([上行Promise, 下行Promise]).then(() => {
-		// Feed remaining per-request bytes into the shared buffer with closing:true —
-		// flushBandwidth decides (5MB/3min) whether they hit D1 right now.
+		// Flush remaining bandwidth to D1 after connection closes
 		if (env && env.DB && ctx && xhttpMatchedUUID && (xhttpBytesUp > 0 || xhttpBytesDown > 0)) {
 			const up = xhttpBytesUp; const down = xhttpBytesDown;
 			xhttpBytesUp = 0; xhttpBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, xhttpMatchedUUID, up, down, { closing: true }));
+			ctx.waitUntil(mgmtTrackBandwidth(env, xhttpMatchedUUID, up, down));
 		}
 	});
 
@@ -6417,7 +5551,7 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, env = n
 	let grpcBytesUp = 0;
 	let grpcBytesDown = 0;
 	let grpcMatchedUUID = null;
-	const GRPC_BW_CHECK_INTERVAL = 25 * 1024 * 1024; // per-request sampling rate; D1 write cadence is buffer-controlled (100MB/5min, see flushBandwidth)
+	const GRPC_BW_CHECK_INTERVAL = 1024 * 1024; // 1MB
 	const trackGRPCBandwidthUp = (chunkSize) => {
 		grpcBytesUp += (chunkSize || 0);
 		if (grpcBytesUp + grpcBytesDown >= GRPC_BW_CHECK_INTERVAL) {
@@ -6689,12 +5823,11 @@ async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}, env = n
 					释放远端写入器();
 					try { reader.releaseLock() } catch (e) { }
 				} else {
-					// Feed remaining per-request bytes into the shared buffer with closing:true
-					// — flushBandwidth decides (5MB/3min) whether they hit D1 right now.
+					// Flush remaining bandwidth to D1
 					if (env && env.DB && ctx && grpcMatchedUUID && (grpcBytesUp > 0 || grpcBytesDown > 0)) {
 						const up = grpcBytesUp; const down = grpcBytesDown;
 						grpcBytesUp = 0; grpcBytesDown = 0;
-						ctx.waitUntil(mgmtTrackBandwidth(env, grpcMatchedUUID, up, down, { closing: true }));
+						ctx.waitUntil(mgmtTrackBandwidth(env, grpcMatchedUUID, up, down));
 					}
 					关闭连接();
 				}
@@ -6793,19 +5926,25 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 	let wsBytesDown = 0;
 	let matchedUUID = null; // Track the actual UUID that was validated
 	let connectionTracked = false; // Track connection only once per WebSocket
-	// subnet of the validated client IP — set at track time, used by the close/error
-	// paths to resolve the DEVICE row key (mgmtRemoveActiveConnection keys rows as
-	// `user_id:subnet`, not per-socket).
-	let clientSubnet = null;
-	const BANDWIDTH_CHECK_INTERVAL = 25 * 1024 * 1024; // feed the shared buffer every 25MB; the
-	// buffer itself flushes to D1 per 100MB/5min (see flushBandwidth) — this is just the
-	// per-socket sampling rate now, the actual D1 write cadence is buffer-controlled.
+	let bandwidthExceeded = false; // Flag to close connection when limit exceeded
+	const BANDWIDTH_CHECK_INTERVAL = 1024 * 1024; // Check every 1MB
 	const trackWSBandwidthUp = (chunkSize) => {
 		wsBytesUp += (chunkSize || 0);
 		if (wsBytesUp + wsBytesDown >= BANDWIDTH_CHECK_INTERVAL) {
 			const up = wsBytesUp; const down = wsBytesDown;
 			wsBytesUp = 0; wsBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, matchedUUID, up, down));
+			ctx.waitUntil((async () => {
+				await mgmtTrackBandwidth(env, matchedUUID, up, down);
+				if (connectionTracked) mgmtHeartbeatConnection(env, connectionId);
+				try {
+					const user = await env.DB.prepare('SELECT max_bandwidth_bytes, used_bandwidth_bytes FROM users WHERE uuid = ?').bind(matchedUUID).first();
+					if (user && user.max_bandwidth_bytes > 0 && user.used_bandwidth_bytes >= user.max_bandwidth_bytes) {
+						bandwidthExceeded = true;
+						log(`[WS] Bandwidth limit exceeded for ${matchedUUID}: ${user.used_bandwidth_bytes}/${user.max_bandwidth_bytes}`);
+						serverSock.close(4004, 'Bandwidth limit exceeded');
+					}
+				} catch (e) { console.error('Bandwidth check error:', e); }
+			})());
 		}
 	};
 	const trackWSBandwidthDown = (chunkSize) => {
@@ -6813,7 +5952,10 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 		if (wsBytesUp + wsBytesDown >= BANDWIDTH_CHECK_INTERVAL) {
 			const up = wsBytesUp; const down = wsBytesDown;
 			wsBytesUp = 0; wsBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, matchedUUID, up, down));
+			ctx.waitUntil((async () => {
+				await mgmtTrackBandwidth(env, matchedUUID, up, down);
+				if (connectionTracked) mgmtHeartbeatConnection(env, connectionId);
+			})());
 		}
 	};
 
@@ -7189,7 +6331,6 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 					return;
 				}
 				connectionTracked = true;
-				clientSubnet = getSubnetGroup(clientIP);
 				matchedUUID = parsedUUID;
 				if (env && env.DB) {
 					await mgmtLogConnection(env, parsedUUID, 'connect', proto, clientIP, url.host);
@@ -7222,7 +6363,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 					if (!isValid) { serverSock.close(4003, 'Connection limit reached'); return; }
 					const tracked = await mgmtAddActiveConnection(env, yourUUID, connectionId, clientIP, 'ss');
 					if (!tracked) { serverSock.close(4003, 'Connection tracking failed'); return; }
-					connectionTracked = true; matchedUUID = yourUUID; clientSubnet = getSubnetGroup(clientIP);
+					connectionTracked = true; matchedUUID = yourUUID;
 					await mgmtLogConnection(env, yourUUID, 'connect', 'ss', clientIP, url.host);
 					await mgmtIncrementRequestCount(env, yourUUID);
 				}
@@ -7244,7 +6385,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 					if (!ok) { serverSock.close(4003, 'Connection limit reached'); return; }
 					const tracked = await mgmtAddActiveConnection(env, parsedUUID, connectionId, clientIP, proto);
 					if (!tracked) { serverSock.close(4003, 'Connection tracking failed'); return; }
-					connectionTracked = true; matchedUUID = parsedUUID; clientSubnet = getSubnetGroup(clientIP);
+					connectionTracked = true; matchedUUID = parsedUUID;
 					await mgmtLogConnection(env, parsedUUID, 'connect', proto, clientIP, url.host);
 					await mgmtIncrementRequestCount(env, parsedUUID);
 				}
@@ -7347,38 +6488,35 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}, env 
 	};
 
 	serverSock.addEventListener('message', (event) => {
+		// Block data if bandwidth limit exceeded
+		if (bandwidthExceeded) return;
 		const chunkBytes = event.data?.byteLength || event.data?.length || 0;
 		trackWSBandwidthUp(chunkBytes);
 		入队WS显式传输(event.data);
 	});
 	serverSock.addEventListener('close', () => {
-		// Flush remaining per-socket bytes into the shared buffer with closing:true —
-		// flushBandwidth then decides (5MB/3min) whether they hit D1 right now.
+		// Flush remaining bandwidth to D1
 		if (env && env.DB && ctx && matchedUUID && (wsBytesUp > 0 || wsBytesDown > 0)) {
 			const up = wsBytesUp; const down = wsBytesDown;
 			wsBytesUp = 0; wsBytesDown = 0;
-			ctx.waitUntil(mgmtTrackBandwidth(env, matchedUUID, up, down, { closing: true }));
+			ctx.waitUntil(mgmtTrackBandwidth(env, matchedUUID, up, down));
 		}
-		// Remove the DEVICE row only if it went quiet — mgmtRemoveActiveConnection keeps
-		// the row alive for 10s after last activity so another socket from the same
-		// device (browsers open many) doesn't flip-flop the device row.
+		// Remove connection from active list (by connection_id for precise removal)
 		if (env && env.DB && ctx && matchedUUID && connectionTracked) {
 			const closeProto = 判断协议类型 === '木马' ? 'trojan' : 'vless';
-			const subnet = clientSubnet || getSubnetGroup(request.headers.get('CF-Connecting-IP') || 'unknown');
 			ctx.waitUntil((async () => {
-				await mgmtRemoveActiveConnection(env, matchedUUID, subnet, closeProto);
-				log(`[WS] Device socket closed: ${subnet}/${closeProto} for ${matchedUUID}`);
+				await mgmtRemoveActiveConnection(env, matchedUUID, connectionId, closeProto);
+				log(`[WS] Connection removed: ${connectionId}/${closeProto} for ${matchedUUID}`);
 			})());
 		}
 		closeSocketQuietly(serverSock);
 		收尾WS显式传输();
 	});
 	serverSock.addEventListener('error', (err) => {
-		// Same device-row cleanup on error (prevents zombie device rows)
+		// Remove connection on error too (prevents zombie entries)
 		if (env && env.DB && ctx && matchedUUID && connectionTracked) {
 			const errorProto = 判断协议类型 === '木马' ? 'trojan' : 'vless';
-			const subnet = clientSubnet || getSubnetGroup(request.headers.get('CF-Connecting-IP') || 'unknown');
-			ctx.waitUntil(mgmtRemoveActiveConnection(env, matchedUUID, subnet, errorProto));
+			ctx.waitUntil(mgmtRemoveActiveConnection(env, matchedUUID, connectionId, errorProto));
 		}
 		处理WS显式传输错误(err);
 	});
