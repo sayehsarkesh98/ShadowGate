@@ -166,18 +166,62 @@ function invalidateUserCache(uuid) {
 // ============================================
 
 // Calculate subnet group for device counting
-// IPv4: /24 (first 3 octets), IPv6: /64 (first 8 groups)
+// IPv4: /24 (first 3 octets), IPv6: /64 (first 4 hextets, :: expanded)
+function expandIPv6(ip) {
+	// Expand :: compression into 8 hextets; returns null if not an IPv6 literal
+	let addr = String(ip || '').trim();
+	if (addr.startsWith('[') && addr.endsWith(']')) addr = addr.slice(1, -1);
+	const pct = addr.indexOf('%');
+	if (pct !== -1) addr = addr.slice(0, pct);
+	if (!addr.includes(':')) return null;
+	const halves = addr.split('::');
+	if (halves.length > 2) return null;
+	const head = halves[0] ? halves[0].split(':') : [];
+	const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+	const missing = 8 - head.length - tail.length;
+	if (missing < 0) return null;
+	const groups = [...head, ...Array(missing).fill('0'), ...tail];
+	if (groups.length !== 8) return null;
+	return groups;
+}
 function getSubnetGroup(ip) {
 	if (!ip || ip === 'unknown') return 'unknown';
-	if (ip.includes(':')) {
-		// IPv6: /64 = first 8 colon-separated groups
-		const parts = ip.split(':');
-		return parts.slice(0, 8).join(':') + '::/64';
+	const v6 = expandIPv6(ip);
+	if (v6) {
+		return v6.slice(0, 4).join(':') + '::/64';
 	}
 	// IPv4: /24 = first 3 octets
-	const parts = ip.split('.');
+	const parts = String(ip).split('.');
 	if (parts.length === 4) return parts.slice(0, 3).join('.') + '.0/24';
 	return ip;
+}
+// Per-isolate open-socket refcount per device (uuid + subnet). A device row is
+// only deleted when its LAST socket closes — otherwise one closing tab knocks
+// a device with several open sockets off the panel and the counter.
+const deviceSocketCounts = new Map(); // key: uuid + '\n' + subnet -> { n, ts }
+// Seen-device keys for cheap "is this a new device?" checks (avoids a users-table
+// UPDATE on every socket open — only genuinely new devices bump the counter).
+const deviceRowSeen = new Map(); // key: numericUserId + ':' + subnet -> timestamp ms
+function deviceSocketOpened(uuid, subnet) {
+	const key = uuid + '\n' + subnet;
+	const rec = deviceSocketCounts.get(key);
+	if (rec) { rec.n += 1; rec.ts = Date.now(); }
+	else deviceSocketCounts.set(key, { n: 1, ts: Date.now() });
+	if (deviceSocketCounts.size > 20000) {
+		const now = Date.now();
+		for (const [k, v] of deviceSocketCounts) {
+			if (now - v.ts > 30 * 60 * 1000) deviceSocketCounts.delete(k);
+		}
+	}
+}
+function deviceSocketClosed(uuid, subnet) {
+	// Returns true when the last known socket for this device closed.
+	const key = uuid + '\n' + subnet;
+	const rec = deviceSocketCounts.get(key);
+	if (!rec) return true;
+	rec.n -= 1;
+	if (rec.n <= 0) { deviceSocketCounts.delete(key); return true; }
+	return false;
 }
 
 async function mgmtValidateUUID(env, uuid, clientIP, protocol) {
@@ -267,6 +311,20 @@ async function mgmtAddActiveConnection(env, uuid, connectionId, ipAddress, proto
 			 VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
 			 ON CONFLICT(connection_id) DO UPDATE SET last_activity = datetime('now'), ip_address = excluded.ip_address, protocol = excluded.protocol`
 		).bind(user.id, user.id + ':' + subnet, ip, subnet, proto).run();
+		// Per-isolate socket refcount (placed AFTER the upsert succeeds, so a
+		// failed open never leaks a count): the device row is deleted only when
+		// the LAST socket from this device closes (see deviceSocketClosed).
+		deviceSocketOpened(uuid, subnet);
+		// New device for this isolate (throttled to one refresh per device per
+		// 60s via deviceRowSeen)? Then recompute this user's live counter +
+		// online flag right away — connects must show up instantly, without
+		// waiting for the next bandwidth flush.
+		const seenDevKey = user.id + ':' + subnet;
+		const nowMs = Date.now();
+		if (nowMs - (deviceRowSeen.get(seenDevKey) || 0) > 60 * 1000) {
+			deviceRowSeen.set(seenDevKey, nowMs);
+			await refreshUserLiveState(env, user.id).catch(() => {});
+		}
 		// Passive cleanup of stale connections — throttled to at most once per minute
 		// (it used to run on EVERY new connection; each pass costs 1 DELETE + 1 big
 		// UPDATE per dirty user, which together with per-WS connect bookkeeping was
@@ -289,13 +347,23 @@ async function mgmtRemoveActiveConnection(env, uuid, connectionId, protocol) {
 		if (!env.DB) return;
 		const user = await getCachedUser(env, uuid);
 		if (!user) return;
-		// Device keys are `<numeric user_id>:<subnet>`; the subnet itself may contain
-		// colons (IPv6 ::/64), so split at the FIRST colon, not the last.
-		const sep = connectionId.indexOf(':');
-		const subnet = sep === -1 ? connectionId : connectionId.slice(sep + 1);
+		// Callers pass the RAW subnet (older device keys were `<userId>:<subnet>`).
+		// A raw IPv6 subnet also contains colons, so only strip an exact
+		// "<this user's numeric id>:" prefix — never split inside the subnet.
+		const rawKey = String(connectionId || '');
+		const idPrefix = user.id + ':';
+		const subnet = rawKey.startsWith(idPrefix) ? rawKey.slice(idPrefix.length) : rawKey;
+		// Only delete when the LAST socket from this device closed (per-isolate
+		// refcount) — one closing tab must not knock a device with several open
+		// sockets off the panel. No 10s grace needed anymore: the refcount IS the
+		// multi-socket protection, and prompt deletion keeps the panel truthful.
+		if (!deviceSocketClosed(uuid, subnet)) return;
 		await env.DB.prepare(
-			"DELETE FROM active_connections WHERE connection_id = ? AND last_activity < datetime('now', '-10 seconds')"
+			'DELETE FROM active_connections WHERE connection_id = ?'
 		).bind(user.id + ':' + subnet).run();
+		// Row gone (or already gone) — recompute this user's live counter +
+		// online flag right away so disconnects show up instantly.
+		await refreshUserLiveState(env, user.id).catch(() => {});
 	} catch (e) {
 		console.error('Remove active connection error:', e);
 	}
@@ -323,6 +391,37 @@ async function mgmtCleanupStaleConnections(env) {
 		}
 	} catch (e) {
 		console.error('Cleanup stale connections error:', e);
+	}
+}
+
+// Throttled wrapper: the passive stale-row purge runs at most once per minute
+// per isolate no matter how many sockets open. (This wrapper was missing for a
+// while, so the passive purge on connect silently never ran and zombie device
+// rows accumulated for hours — the panel then showed long-dead "connections".)
+const mgmtCleanupThrottle = { last: 0 };
+async function mgmtMaybeCleanupStaleConnections(env) {
+	try {
+		const now = Date.now();
+		if (now - mgmtCleanupThrottle.last < 60 * 1000) return;
+		mgmtCleanupThrottle.last = now;
+		await mgmtCleanupStaleConnections(env);
+	} catch (e) {
+		console.error('Cleanup throttle error:', e);
+	}
+}
+
+// Recompute one user's live connection state from FRESH device rows only.
+// current_connections = distinct live subnets; is_online = 1 iff any live row.
+// Single UPDATE (1 write) — called on new-device connects, last-socket closes
+// and manual disconnects so the panel is exact between bandwidth flushes.
+async function refreshUserLiveState(env, userId) {
+	try {
+		if (!env.DB || userId == null) return;
+		await env.DB.prepare(
+			'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")), is_online = CASE WHEN (SELECT COUNT(*) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")) > 0 THEN 1 ELSE 0 END WHERE id = ?'
+		).bind(userId, userId, userId).run();
+	} catch (e) {
+		console.error('Refresh live state error:', e);
 	}
 }
 
@@ -407,7 +506,7 @@ async function flushBandwidth(env, uuid, closing) {
             `).bind(user.id, today, compensatedUp, compensatedDown, compensatedTotal, Math.max(connDelta, 0),
                 compensatedUp, compensatedDown, compensatedTotal, Math.max(connDelta, 0)),
             env.DB.prepare(
-                'UPDATE users SET used_bandwidth_bytes = used_bandwidth_bytes + ?, total_requests = total_requests + ?, is_online = 1, last_online_at = datetime("now"), last_used_at = datetime("now"), current_connections = (SELECT COUNT(*) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")) WHERE id = ?'
+                'UPDATE users SET used_bandwidth_bytes = used_bandwidth_bytes + ?, total_requests = total_requests + ?, is_online = 1, last_online_at = datetime("now"), last_used_at = datetime("now"), current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")) WHERE id = ?'
             ).bind(compensatedTotal, Math.max(connDelta, 0), user.id, user.id),
             // Device-row heartbeat: flushes fire every 100MB/5min while traffic flows,
             // so this keeps idle-but-open devices from being purged by the 10-min
@@ -689,7 +788,13 @@ async function mgmtVerifyAuth(request, env) {
 
 async function mgmtGetUsers(env, params = {}) {
     try {
-        let query = 'SELECT u.*, p.name as plan_name FROM users u LEFT JOIN plans p ON u.plan_id = p.id WHERE 1=1';
+        // Live counters are computed inline from FRESH device rows (10-min
+        // window) — the stored users.current_connections / is_online columns
+        // lag between bandwidth flushes, so the panel must not trust them.
+        let query = `SELECT u.*, p.name as plan_name,
+            (SELECT COUNT(DISTINCT subnet) FROM active_connections ac WHERE ac.user_id = u.id AND ac.last_activity >= datetime('now', '-10 minutes')) AS live_connections,
+            CASE WHEN EXISTS (SELECT 1 FROM active_connections ac2 WHERE ac2.user_id = u.id AND ac2.last_activity >= datetime('now', '-10 minutes')) THEN 1 ELSE 0 END AS live_online
+            FROM users u LEFT JOIN plans p ON u.plan_id = p.id WHERE 1=1`;
         const bindings = [];
 
         // Search
@@ -742,8 +847,15 @@ async function mgmtGetUsers(env, params = {}) {
         }
         const count = await env.DB.prepare(countQuery).bind(...countBindings).first();
 
+        // Overwrite the lagging stored columns with the live values computed
+        // above, so every users-table render shows the truth, not the cache.
+        const rows = (users.results || []).map(r => ({
+            ...r,
+            current_connections: r.live_connections != null ? r.live_connections : (r.current_connections || 0),
+            is_online: (r.live_online != null ? r.live_online : (r.is_online ? 1 : 0)) ? 1 : 0,
+        }));
         return mgmtJsonResponse({
-            users: users.results,
+            users: rows,
             total: count?.c || 0,
             page,
             limit
@@ -961,6 +1073,17 @@ async function mgmtGetUserStatus(uuid, env) {
         const isExpired = user.expires_at && user.expires_at <= currentTimestamp();
         const maxBW = user.max_bandwidth_bytes || (user.max_bandwidth_mb || 0) * 1024 * 1024;
 
+        // Live device count from fresh rows only — never the lagging column.
+        let liveDev = user.current_connections || 0;
+        let liveOnline = user.is_online === 1;
+        try {
+            const live = await env.DB.prepare(
+                "SELECT COUNT(DISTINCT subnet) AS c FROM active_connections WHERE user_id = ? AND last_activity >= datetime('now', '-10 minutes')"
+            ).bind(user.id).first();
+            if (live) { liveDev = live.c || 0; liveOnline = liveDev > 0; }
+            else { liveDev = 0; liveOnline = false; }
+        } catch (_) { /* fall back to stored columns */ }
+
         return mgmtJsonResponse({
             user: {
                 uuid: user.uuid,
@@ -973,10 +1096,10 @@ async function mgmtGetUserStatus(uuid, env) {
                 used_bandwidth_bytes: user.used_bandwidth_bytes || bw?.t || 0,
                 bandwidth_usage_percent: maxBW > 0 ? Math.round(((user.used_bandwidth_bytes || 0) / maxBW) * 100) : 0,
                 max_connections: user.max_connections,
-                current_connections: user.current_connections,
+                current_connections: liveDev,
                 total_requests: user.total_requests || 0,
                 last_used_at: user.last_used_at,
-                is_online: user.is_online === 1,
+                is_online: liveOnline,
                 last_ip: user.last_ip,
                 plan_id: user.plan_id,
                 tags: user.tags,
@@ -1140,7 +1263,9 @@ async function mgmtGetStats(env) {
         const today = await env.DB.prepare(
             'SELECT SUM(total_bytes) as t FROM bandwidth_usage WHERE date = date("now", "+3 hours", "+30 minutes")'
         ).first();
-        const online = await env.DB.prepare('SELECT COUNT(*) as c FROM users WHERE is_online = 1').first();
+        // Live online count from FRESH device rows — users.is_online lags when
+        // traffic goes idle (a user can sit flagged online for hours).
+        const online = await env.DB.prepare("SELECT COUNT(DISTINCT user_id) as c FROM active_connections WHERE last_activity >= datetime('now', '-10 minutes')").first();
         const expired = await env.DB.prepare(
             'SELECT COUNT(*) as c FROM users WHERE expires_at <= datetime("now") AND expires_at IS NOT NULL'
         ).first();
@@ -1468,12 +1593,29 @@ async function mgmtBulkCreateCleanIPs(request, env) {
 
 async function mgmtGetActiveConnections(env) {
     try {
-        // Clean up stale connections first
-        await mgmtCleanupStaleConnections(env);
+        // Opportunistic purge (panel views are the most reliable trigger when
+        // traffic is idle): drop zombie rows and refresh affected users' live
+        // state, then list ONLY live rows — a 10-hour-old row must never show
+        // up as an active connection. Purge writes are bounded: only already-
+        // stale rows are touched, whichever trigger (connect/cron/panel) gets
+        // there first.
+        if (env.DB) {
+            try {
+                const purge = await env.DB.prepare(
+                    "DELETE FROM active_connections WHERE last_activity < datetime('now', '-10 minutes')"
+                ).run();
+                if (((purge.meta && purge.meta.changes) || purge.changes || 0) > 0) {
+                    await env.DB.prepare(
+                        'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes")), is_online = CASE WHEN (SELECT COUNT(*) FROM active_connections WHERE user_id = users.id AND last_activity >= datetime("now", "-10 minutes")) > 0 THEN 1 ELSE 0 END WHERE is_online = 1 OR current_connections > 0'
+                    ).run();
+                }
+            } catch (_) { /* purge is best-effort; the list below must still work */ }
+        }
         const connections = await env.DB.prepare(`
             SELECT ac.*, u.username, u.uuid
             FROM active_connections ac
             LEFT JOIN users u ON ac.user_id = u.id
+            WHERE ac.last_activity >= datetime('now', '-10 minutes')
             ORDER BY ac.last_activity DESC
         `).all();
         return mgmtJsonResponse({ connections: connections.results });
@@ -1488,8 +1630,8 @@ async function mgmtDisconnectUser(rowId, env) {
         await env.DB.prepare('DELETE FROM active_connections WHERE id = ?').bind(rowId).run();
         if (row) {
             await env.DB.prepare(
-                'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ?) WHERE id = ?'
-            ).bind(row.user_id, row.user_id).run();
+                'UPDATE users SET current_connections = (SELECT COUNT(DISTINCT subnet) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")), is_online = CASE WHEN (SELECT COUNT(*) FROM active_connections WHERE user_id = ? AND last_activity >= datetime("now", "-10 minutes")) > 0 THEN 1 ELSE 0 END WHERE id = ?'
+            ).bind(row.user_id, row.user_id, row.user_id).run();
         }
         return mgmtJsonResponse({ success: true });
     } catch (e) {
@@ -2509,7 +2651,7 @@ function mgmtAdminHTML() {
                 <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:0.5rem;margin-bottom:1rem">
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">کل</h3><div class="val" id="statTotal" style="font-size:1.2rem">0</div></div>
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">فعال</h3><div class="val success" id="statActive" style="font-size:1.2rem">0</div></div>
-                    <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">آفلاین</h3><div class="val warning" id="statOnline" style="font-size:1.2rem">0</div></div>
+                    <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">آنلاین</h3><div class="val warning" id="statOnline" style="font-size:1.2rem">0</div></div>
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">منقضی</h3><div class="val danger" id="statExpired" style="font-size:1.2rem">0</div></div>
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">ترافیک امروز</h3><div class="val" id="statTodayBW" style="font-size:1.2rem">0 B</div></div>
                 </div>
@@ -4209,11 +4351,11 @@ async function userPanelFetchData(env, user) {
         recentConns = r.results || [];
     } catch (e) { /* ignore */ }
 
-    // Online devices (distinct subnets in the 5-min window, same as counter)
+    // Online devices (distinct subnets in the 10-min window, same as counter)
     let devices = 0;
     try {
         const r = await env.DB.prepare(
-            "SELECT COUNT(DISTINCT subnet) AS c FROM active_connections WHERE user_id = ? AND last_activity >= datetime('now', '-5 minutes')"
+            "SELECT COUNT(DISTINCT subnet) AS c FROM active_connections WHERE user_id = ? AND last_activity >= datetime('now', '-10 minutes')"
         ).bind(uid).first();
         devices = r?.c || 0;
     } catch (e) { /* ignore */ }
