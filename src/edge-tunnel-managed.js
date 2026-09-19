@@ -304,32 +304,29 @@ async function mgmtAddActiveConnection(env, uuid, connectionId, ipAddress, proto
 		const e = bufferEntry(uuid);
 		e.devices.add(subnet);
 		if (!e.firstTs) e.firstTs = Date.now();
-		// One upsert per DEVICE (per user+subnet), not per socket. Repeated connects
-		// from the same device just bump last_activity — one write either way.
-		await env.DB.prepare(
-			`INSERT INTO active_connections (user_id, connection_id, ip_address, subnet, protocol, connected_at, last_activity)
-			 VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-			 ON CONFLICT(connection_id) DO UPDATE SET last_activity = datetime('now'), ip_address = excluded.ip_address, protocol = excluded.protocol`
-		).bind(user.id, user.id + ':' + subnet, ip, subnet, proto).run();
-		// Per-isolate socket refcount (placed AFTER the upsert succeeds, so a
-		// failed open never leaks a count): the device row is deleted only when
-		// the LAST socket from this device closes (see deviceSocketClosed).
-		deviceSocketOpened(uuid, subnet);
-		// New device for this isolate (throttled to one refresh per device per
-		// 60s via deviceRowSeen)? Then recompute this user's live counter +
-		// online flag right away — connects must show up instantly, without
-		// waiting for the next bandwidth flush.
+		// D1 write diet: sockets do NOT write to D1 individually anymore. The
+		// socket is registered in-isolate (refcount + pending set); the device row
+		// upsert rides the periodic bandwidth flush batch (flushBandwidth), and
+		// only fires when this isolate actually knows a row write is needed:
+		// the device is NEW here (not seen in the last 90s). Repeat connects from
+		// a known device = zero D1 writes. fail-open: tracking never breaks the tunnel.
 		const seenDevKey = user.id + ':' + subnet;
 		const nowMs = Date.now();
-		if (nowMs - (deviceRowSeen.get(seenDevKey) || 0) > 60 * 1000) {
+		const isFirstSeen = nowMs - (deviceRowSeen.get(seenDevKey) || 0) > 90 * 1000;
+		deviceSocketOpened(uuid, subnet);
+		if (isFirstSeen) {
 			deviceRowSeen.set(seenDevKey, nowMs);
-			await refreshUserLiveState(env, user.id).catch(() => {});
+			const entry = bufferEntry(uuid);
+			entry.pendingDevices.add(subnet);
+			entry.pendingIps.set(subnet, ip);
+			entry.pendingProtos.set(subnet, proto);
+			if (!entry.firstTs) entry.firstTs = Date.now();
+			// Kick a flush soon so brand-new devices appear quickly (bounded: the
+			// flush itself still batches everything into ONE round-trip).
+			bwScheduleFlush(env, uuid).catch(() => {});
 		}
-		// Passive cleanup of stale connections — throttled to at most once per minute
-		// (it used to run on EVERY new connection; each pass costs 1 DELETE + 1 big
-		// UPDATE per dirty user, which together with per-WS connect bookkeeping was
-		// burning through D1's free-tier 100k daily row-write limit in hours).
-		mgmtMaybeCleanupStaleConnections(env).catch(() => {});
+		// Passive stale-row purge is NOT triggered per-connect anymore (option 3):
+		// it runs on admin-panel views, a 5-min timer, and the nightly cron.
 		return true;
 	} catch (e) {
 		// D1 write failed (quota exhausted, transient error) → fail OPEN: allow the
@@ -353,16 +350,13 @@ async function mgmtRemoveActiveConnection(env, uuid, connectionId, protocol) {
 		const rawKey = String(connectionId || '');
 		const idPrefix = user.id + ':';
 		const subnet = rawKey.startsWith(idPrefix) ? rawKey.slice(idPrefix.length) : rawKey;
-		// Only delete when the LAST socket from this device closed (per-isolate
-		// refcount) — one closing tab must not knock a device with several open
-		// sockets off the panel. No 10s grace needed anymore: the refcount IS the
-		// multi-socket protection, and prompt deletion keeps the panel truthful.
+		// Only proceed when the LAST socket from this device closed (per-isolate
+		// refcount) — one closing tab must not drop a device with other open
+		// sockets. D1 write diet: NO per-close DELETE anymore. The device row
+		// simply ages out of the 10-min live window (panel + counters read only
+		// fresh rows), so the cleanup purge removes it later — one write instead
+		// of tens of thousands of per-socket DELETEs per day.
 		if (!deviceSocketClosed(uuid, subnet)) return;
-		await env.DB.prepare(
-			'DELETE FROM active_connections WHERE connection_id = ?'
-		).bind(user.id + ':' + subnet).run();
-		// Row gone (or already gone) — recompute this user's live counter +
-		// online flag right away so disconnects show up instantly.
 		await refreshUserLiveState(env, user.id).catch(() => {});
 	} catch (e) {
 		console.error('Remove active connection error:', e);
@@ -402,7 +396,7 @@ const mgmtCleanupThrottle = { last: 0 };
 async function mgmtMaybeCleanupStaleConnections(env) {
 	try {
 		const now = Date.now();
-		if (now - mgmtCleanupThrottle.last < 60 * 1000) return;
+		if (now - mgmtCleanupThrottle.last < 5 * 60 * 1000) return;
 		mgmtCleanupThrottle.last = now;
 		await mgmtCleanupStaleConnections(env);
 	} catch (e) {
@@ -448,10 +442,23 @@ const bwBuffer = new Map(); // uuid -> { up, down, connects, devices, firstTs, l
 function bufferEntry(uuid) {
     let e = bwBuffer.get(uuid);
     if (!e) {
-        e = { up: 0, down: 0, connects: 0, devices: new Set(), firstTs: 0, lastTs: 0, flushing: false };
+        e = { up: 0, down: 0, connects: 0, devices: new Set(), firstTs: 0, lastTs: 0, flushing: false,
+              pendingDevices: new Set(), pendingIps: new Map(), pendingProtos: new Map() };
         bwBuffer.set(uuid, e);
     }
+    if (!e.pendingDevices) { e.pendingDevices = new Set(); e.pendingIps = new Map(); e.pendingProtos = new Map(); }
     return e;
+}
+
+// Kick a flush within ~2s without stacking timers: one per uuid max.
+const bwFlushTimers = new Map();
+function bwScheduleFlush(env, uuid) {
+    if (bwFlushTimers.has(uuid)) return;
+    const t = setTimeout(() => {
+        bwFlushTimers.delete(uuid);
+        flushBandwidth(env, uuid, false).catch(() => {});
+    }, 2000);
+    bwFlushTimers.set(uuid, t);
 }
 
 async function flushBandwidth(env, uuid, closing) {
@@ -492,6 +499,27 @@ async function flushBandwidth(env, uuid, closing) {
         const compensatedTotal = compensatedUp + compensatedDown;
         const connDelta = connects;
 
+        // Pending device-row upserts (from new-device connects) ride the same
+        // batch — each pending device is ONE statement, batched with everything
+        // else, so N new devices still cost ONE round-trip.
+        const pendingUpserts = [];
+        const pendingUpsertsFailed = [];
+        if (e.pendingDevices && e.pendingDevices.size) {
+            for (const sub of e.pendingDevices) {
+                const pip = e.pendingIps.get(sub) || 'unknown';
+                const pproto = e.pendingProtos.get(sub) || 'vless';
+                pendingUpsertsFailed.push({ sub, ip: pip, proto: pproto });
+                // user.id is numeric; re-fetch is avoided because the SELECT above
+                // already returned it.
+                pendingUpserts.push(env.DB.prepare(
+                    `INSERT INTO active_connections (user_id, connection_id, ip_address, subnet, protocol, connected_at, last_activity)
+                     VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                     ON CONFLICT(connection_id) DO UPDATE SET last_activity = datetime('now'), ip_address = excluded.ip_address, protocol = excluded.protocol`
+                ).bind(user.id, user.id + ':' + sub, pip, sub, pproto));
+            }
+            e.pendingDevices.clear(); e.pendingIps.clear(); e.pendingProtos.clear();
+        }
+
         // ONE round-trip for: daily rollup + user total + connect counter + online/device state
         await env.DB.batch([
             env.DB.prepare(`
@@ -514,6 +542,7 @@ async function flushBandwidth(env, uuid, closing) {
             env.DB.prepare(
                 "UPDATE active_connections SET last_activity = datetime('now') WHERE user_id = ?"
             ).bind(user.id),
+            ...pendingUpserts,
         ]);
         invalidateUserCache(uuid);
         await checkBandwidthAlerts(env, user.id, uuid, (user.used_bandwidth_bytes || 0) + compensatedTotal);
@@ -521,7 +550,18 @@ async function flushBandwidth(env, uuid, closing) {
         console.error('Bandwidth flush error:', err);
         // Write failed (quota/transient) — put the bytes back so they're billed on the next flush.
         const cur = bwBuffer.get(uuid);
-        if (cur) { cur.up += up; cur.down += down; cur.connects += connects; if (!cur.firstTs) cur.firstTs = Date.now() - BW_BUFFER_MAX_AGE + 30 * 1000; }
+        if (cur) {
+            cur.up += up; cur.down += down; cur.connects += connects;
+            if (!cur.firstTs) cur.firstTs = Date.now() - BW_BUFFER_MAX_AGE + 30 * 1000;
+            // Pending device upserts that failed with the batch go back in the
+            // pending set so the next flush retries them (fail-open for tracking).
+            if (!cur.pendingDevices) { cur.pendingDevices = new Set(); cur.pendingIps = new Map(); cur.pendingProtos = new Map(); }
+            for (const pu of pendingUpsertsFailed) {
+                cur.pendingDevices.add(pu.sub);
+                cur.pendingIps.set(pu.sub, pu.ip);
+                cur.pendingProtos.set(pu.sub, pu.proto);
+            }
+        }
     } finally {
         const cur = bwBuffer.get(uuid);
         if (cur) { cur.flushing = false; cur.lastTs = Date.now(); }
