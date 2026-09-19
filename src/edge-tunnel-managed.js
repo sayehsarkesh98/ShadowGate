@@ -4720,6 +4720,10 @@ async function handleCron(env) {
         // 4. Clean old logs (older than 30 days)
         await cleanOldLogs(env);
 
+        // 4b. Purge stale device rows (write-diet: the per-connect purge was
+        // removed; nightly cron keeps active_connections bounded instead)
+        await mgmtCleanupStaleConnections(env);
+
         // 5. Process notification queue
         await processNotifications(env);
 
