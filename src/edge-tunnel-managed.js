@@ -2372,8 +2372,8 @@ function mgmtAdminHTML() {
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         :root {
-            --bg-primary: #0a0e1a;
-            --bg-secondary: rgba(17, 24, 39, 0.72);
+            --bg-primary: #070b16;
+            --bg-secondary: rgba(19, 27, 46, 0.62);
             --bg-tertiary: rgba(31, 41, 55, 0.6);
             --bg-solid: #111827;
             --text-primary: #f1f5f9;
@@ -2387,13 +2387,19 @@ function mgmtAdminHTML() {
             --danger: #f87171;
             --border: rgba(148, 163, 184, 0.14);
             --border-strong: rgba(148, 163, 184, 0.28);
-            --glass: rgba(17, 24, 39, 0.66);
-            --radius: 14px;
-            --radius-sm: 9px;
-            --shadow: 0 10px 40px -12px rgba(0, 0, 0, 0.55);
+            --glass: rgba(19, 27, 46, 0.58);
+            --glass-hi: rgba(30, 42, 72, 0.55);
+            --glass-deep: rgba(11, 16, 30, 0.72);
+            --radius: 18px;
+            --radius-sm: 11px;
+            --shadow: 0 18px 55px -18px rgba(0, 0, 0, 0.7);
             --glow-accent: 0 0 24px -6px rgba(56, 189, 248, 0.45);
+            --field: rgba(8, 12, 24, 0.78);
+            --ring: conic-gradient(from var(--beam, 0deg), transparent 0deg, transparent 248deg, #38bdf8 288deg, #818cf8 308deg, #34d399 328deg, transparent 360deg);
             --font: 'Segoe UI', Tahoma, sans-serif;
         }
+        @property --beam { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
+        @keyframes beamspin { to { --beam: 360deg; } }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html { scrollbar-color: rgba(148,163,184,0.3) transparent; }
         ::-webkit-scrollbar { width: 9px; height: 9px; }
@@ -2401,12 +2407,17 @@ function mgmtAdminHTML() {
         ::-webkit-scrollbar-thumb:hover { background: rgba(148,163,184,0.45); }
         ::-webkit-scrollbar-track { background: transparent; }
         ::selection { background: rgba(56,189,248,0.32); }
+        :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
         body {
             font-family: var(--font); color: var(--text-primary); min-height: 100vh;
             background:
-                radial-gradient(1100px 520px at 82% -8%, rgba(56,189,248,0.13), transparent 62%),
-                radial-gradient(950px 480px at 12% 108%, rgba(129,140,248,0.12), transparent 60%),
-                linear-gradient(160deg, #0a0e1a 0%, #0d1226 48%, #0a0e1a 100%);
+                radial-gradient(1100px 520px at 82% -8%, rgba(56,189,248,0.16), transparent 62%),
+                radial-gradient(880px 500px at 6% 14%, rgba(52,211,153,0.07), transparent 60%),
+                radial-gradient(950px 480px at 12% 108%, rgba(129,140,248,0.15), transparent 60%),
+                radial-gradient(700px 420px at 95% 70%, rgba(56,189,248,0.06), transparent 60%),
+                radial-gradient(rgba(148,163,184,0.05) 1px, transparent 1.4px),
+                linear-gradient(160deg, #070b16 0%, #0b1226 48%, #070b16 100%);
+            background-size: auto, auto, auto, auto, 26px 26px, auto;
             background-attachment: fixed;
         }
         body::before {
@@ -2418,20 +2429,25 @@ function mgmtAdminHTML() {
         }
         @keyframes floatUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes spinOnce { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+        }
 
         /* ---------- Glass cards ---------- */
         .login-form, .panel, .stat, .modal-content, .header, .nav {
-            background: var(--glass) !important;
-            backdrop-filter: blur(18px) saturate(1.25);
-            -webkit-backdrop-filter: blur(18px) saturate(1.25);
+            background: linear-gradient(165deg, var(--glass-hi), var(--glass-deep) 62%) !important;
+            backdrop-filter: blur(20px) saturate(1.35);
+            -webkit-backdrop-filter: blur(20px) saturate(1.35);
             border: 1px solid var(--border) !important;
-            box-shadow: var(--shadow);
+            box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.07), inset 0 -14px 26px -20px rgba(56,189,248,0.28);
         }
 
         /* ---------- Login ---------- */
         .login-box { display: flex; justify-content: center; align-items: center; min-height: 100vh; position: relative; z-index: 1; }
         .login-form { background: var(--glass); padding: 2.4rem 2.2rem; border-radius: 20px; width: 100%; max-width: 400px; box-shadow: var(--shadow), var(--glow-accent); animation: floatUp 0.5s ease both; }
-        .login-form h1 { text-align: center; margin-bottom: 1.7rem; font-size: 1.45rem; font-weight: 700; letter-spacing: 0.3px; background: linear-gradient(120deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+        .login-form { position: relative; overflow: hidden; }
+        .login-form::before { content: ''; position: absolute; inset: 0 0 auto 0; height: 3px; background: linear-gradient(90deg, transparent, var(--accent), var(--accent-2), var(--success), transparent); opacity: 0.8; }
+        .login-form h1 { text-align: center; margin-bottom: 1.7rem; font-size: 1.5rem; font-weight: 800; letter-spacing: 0.3px; background: linear-gradient(120deg, #7dd3fc, var(--accent) 45%, var(--accent-2)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; filter: drop-shadow(0 0 14px rgba(56,189,248,0.35)); }
         .login-form input { width: 100%; padding: 0.8rem 1rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: rgba(10, 14, 26, 0.7); color: var(--text-primary); font-size: 0.95rem; transition: border-color 0.2s, box-shadow 0.2s; }
         .login-form input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.16); }
         .login-form input::placeholder { color: var(--text-dim); }
@@ -2440,8 +2456,8 @@ function mgmtAdminHTML() {
         .login-form button:active { transform: translateY(0); }
 
         /* ---------- Header ---------- */
-        .header { position: sticky; top: 0; z-index: 50; padding: 0.85rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); border-radius: 0 !important; }
-        .header h1 { font-size: 1.15rem; font-weight: 700; background: linear-gradient(120deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+        .header { position: sticky; top: 0; z-index: 50; padding: 0.85rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); border-radius: 0 0 18px 18px !important; box-shadow: 0 14px 36px -20px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.06); }
+        .header h1 { font-size: 1.2rem; font-weight: 800; letter-spacing: 0.2px; background: linear-gradient(120deg, #7dd3fc, var(--accent) 45%, var(--accent-2)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; filter: drop-shadow(0 0 12px rgba(56,189,248,0.35)); }
         .header-actions { display: flex; gap: 0.5rem; }
 
         /* ---------- Nav ---------- */
@@ -2463,8 +2479,9 @@ function mgmtAdminHTML() {
 
         /* ---------- Stats ---------- */
         .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.9rem; margin-bottom: 1.8rem; }
-        .stat { position: relative; overflow: hidden; padding: 1.15rem 1.2rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--glass); backdrop-filter: blur(18px) saturate(1.25); -webkit-backdrop-filter: blur(18px) saturate(1.25); box-shadow: var(--shadow); transition: transform 0.2s, border-color 0.25s, box-shadow 0.25s; }
-        .stat:hover { transform: translateY(-3px); border-color: var(--border-strong); box-shadow: var(--shadow), 0 0 22px -10px rgba(56,189,248,0.4); }
+        .stat { position: relative; overflow: hidden; padding: 1.15rem 1.2rem; border-radius: var(--radius); border: 1px solid var(--border); background: linear-gradient(165deg, var(--glass-hi), var(--glass-deep) 62%); backdrop-filter: blur(20px) saturate(1.35); -webkit-backdrop-filter: blur(20px) saturate(1.35); box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.07); transition: transform 0.2s, border-color 0.25s, box-shadow 0.25s; }
+        .stat:hover { transform: translateY(-3px); border-color: rgba(56,189,248,0.4); box-shadow: var(--shadow), 0 0 26px -8px rgba(56,189,248,0.5), inset 0 1px 0 rgba(255,255,255,0.09); }
+        .stat::before { content: ''; position: absolute; inset: 0 0 auto 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--accent-2), transparent); opacity: 0.55; }
         .stat::after { content: ''; position: absolute; inset-inline-start: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(180deg, var(--accent), transparent); opacity: 0.75; }
         .stat h3 { color: var(--text-secondary); font-size: 0.78rem; margin-bottom: 0.55rem; font-weight: 600; display: flex; align-items: center; gap: 0.4rem; }
         .stat .val { font-size: 1.55rem; font-weight: 800; color: var(--accent); font-variant-numeric: tabular-nums; text-shadow: 0 0 18px rgba(56,189,248,0.35); }
@@ -2492,10 +2509,13 @@ function mgmtAdminHTML() {
         .table-container { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--border); background: var(--glass); backdrop-filter: blur(18px) saturate(1.25); -webkit-backdrop-filter: blur(18px) saturate(1.25); box-shadow: var(--shadow); }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 0.78rem 0.9rem; text-align: right; border-bottom: 1px solid var(--border); }
-        th { background: rgba(10, 14, 26, 0.6); color: var(--text-secondary); font-weight: 700; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; position: sticky; top: 0; }
+        th { background: linear-gradient(180deg, rgba(24,33,58,0.85), rgba(10,14,26,0.6)); color: var(--text-secondary); font-weight: 700; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; position: sticky; top: 0; }
         tr { transition: background 0.15s; }
-        tbody tr:hover { background: rgba(56,189,248,0.055); }
+        tbody tr:nth-child(even) { background: rgba(148,163,184,0.035); }
+        tbody tr:hover { background: rgba(56,189,248,0.075); }
         tbody tr:last-child td { border-bottom: none; }
+        tbody tr:first-child td:first-child { border-start-start-radius: 0; }
+        .table-container { box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.05); }
         .uuid-copy { font-family: ui-monospace, monospace; font-size: 0.74rem; word-break: break-all; max-width: 200px; }
 
         /* ---------- Forms ---------- */
@@ -2503,7 +2523,7 @@ function mgmtAdminHTML() {
         .form-group label { display: block; margin-bottom: 0.5rem; color: var(--text-secondary); font-size: 0.83rem; font-weight: 600; }
         .form-group input, .form-group select, .form-group textarea, .search-box input, .toolbar select {
             width: 100%; padding: 0.7rem 0.9rem; border: 1px solid var(--border); border-radius: var(--radius-sm);
-            background: rgba(10, 14, 26, 0.7); color: var(--text-primary); font-size: 0.92rem; transition: border-color 0.2s, box-shadow 0.2s;
+            background: var(--field); color: var(--text-primary); font-size: 0.92rem; transition: border-color 0.2s, box-shadow 0.2s; box-shadow: inset 0 2px 8px -4px rgba(0,0,0,0.7);
         }
         .form-group input:focus, .form-group select:focus, .form-group textarea:focus, .search-box input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,0.16); }
         .form-group input::placeholder, .search-box input::placeholder { color: var(--text-dim); }
@@ -2513,7 +2533,7 @@ function mgmtAdminHTML() {
         /* ---------- Modal ---------- */
         .modal { display: none; position: fixed; inset: 0; background: rgba(4, 8, 16, 0.72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); z-index: 1000; justify-content: center; align-items: center; padding: 1rem; }
         .modal.active { display: flex; }
-        .modal-content { background: var(--glass) !important; backdrop-filter: blur(24px) saturate(1.3); -webkit-backdrop-filter: blur(24px) saturate(1.3); padding: 1.8rem; border-radius: 18px; width: 100%; max-width: 600px; max-height: 90vh; overflow-y: auto; border: 1px solid var(--border-strong) !important; box-shadow: var(--shadow), var(--glow-accent); animation: floatUp 0.28s ease both; }
+        .modal-content { background: linear-gradient(165deg, var(--glass-hi), var(--glass-deep) 62%) !important; backdrop-filter: blur(24px) saturate(1.35); -webkit-backdrop-filter: blur(24px) saturate(1.35); padding: 1.8rem; border-radius: 20px; width: 100%; max-width: 600px; max-height: 90vh; overflow-y: auto; border: 1px solid var(--border-strong) !important; box-shadow: var(--shadow), var(--glow-accent), inset 0 1px 0 rgba(255,255,255,0.08); animation: floatUp 0.28s ease both; }
         .modal-content h2 { margin-bottom: 1.4rem; font-size: 1.15rem; font-weight: 700; background: linear-gradient(120deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
 
         /* ---------- Toolbar ---------- */
@@ -2636,27 +2656,28 @@ function mgmtAdminHTML() {
             </div>
         </div>
         <div class="nav">
-            <div class="nav-item active" onclick="showSection('dashboard-section', this)"><svg class="icon"><use href="#i-dashboard"/></svg>داشبورد</div>
-            <div class="nav-item" onclick="showSection('users-section', this)"><svg class="icon"><use href="#i-users"/></svg>کاربران</div>
-            <div class="nav-item" onclick="showSection('plans-section', this)"><svg class="icon"><use href="#i-box"/></svg>پلن‌ها</div>
-            <div class="nav-item" onclick="showSection('connections-section', this)"><svg class="icon"><use href="#i-link"/></svg>اتصالات</div>
-            <div class="nav-item" onclick="showSection('logs-section', this)"><svg class="icon"><use href="#i-list"/></svg>لاگ‌ها</div>
-            <div class="nav-item" onclick="showSection('cleanips-section', this)"><svg class="icon"><use href="#i-globe"/></svg>Clean IP ها</div>
-            <div class="nav-item" onclick="showSection('settings-section', this)"><svg class="icon"><use href="#i-gear"/></svg>تنظیمات</div>
+            <div class="nav-item active" onclick="showSection('dashboard-section', this)" role="tab" aria-selected="true" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showSection('dashboard-section',this)}"><svg class="icon"><use href="#i-dashboard"/></svg>داشبورد</div>
+            <div class="nav-item" onclick="showSection('users-section', this)" role="tab" aria-selected="false" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showSection('users-section',this)}"><svg class="icon"><use href="#i-users"/></svg>کاربران</div>
+            <div class="nav-item" onclick="showSection('plans-section', this)" role="tab" aria-selected="false" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showSection('plans-section',this)}"><svg class="icon"><use href="#i-box"/></svg>پلن‌ها</div>
+            <div class="nav-item" onclick="showSection('connections-section', this)" role="tab" aria-selected="false" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showSection('connections-section',this)}"><svg class="icon"><use href="#i-link"/></svg>اتصالات</div>
+            <div class="nav-item" onclick="showSection('logs-section', this)" role="tab" aria-selected="false" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showSection('logs-section',this)}"><svg class="icon"><use href="#i-list"/></svg>لاگ‌ها</div>
+            <div class="nav-item" onclick="showSection('cleanips-section', this)" role="tab" aria-selected="false" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showSection('cleanips-section',this)}"><svg class="icon"><use href="#i-globe"/></svg>Clean IP ها</div>
+            <div class="nav-item" onclick="showSection('settings-section', this)" role="tab" aria-selected="false" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showSection('settings-section',this)}"><svg class="icon"><use href="#i-gear"/></svg>تنظیمات</div>
         </div>
 
         <div class="container">
             <!-- Dashboard Section -->
             <div id="dashboard-section" class="section">
-                <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:0.5rem;margin-bottom:1rem">
+                <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:0.5rem;margin-bottom:1rem" role="status" aria-live="polite" aria-label="خلاصه وضعیت">
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">کل</h3><div class="val" id="statTotal" style="font-size:1.2rem">0</div></div>
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">فعال</h3><div class="val success" id="statActive" style="font-size:1.2rem">0</div></div>
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">آنلاین</h3><div class="val warning" id="statOnline" style="font-size:1.2rem">0</div></div>
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">منقضی</h3><div class="val danger" id="statExpired" style="font-size:1.2rem">0</div></div>
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">ترافیک امروز</h3><div class="val" id="statTodayBW" style="font-size:1.2rem">0 B</div></div>
                 </div>
-                <div class="chart-container" style="padding:0.75rem">
-                    <canvas id="bandwidthChart" height="80"></canvas>
+                <div class="chart-container" style="padding:1.25rem">
+                    <div class="chart-header"><h3><svg class="icon"><use href="#i-dashboard"/></svg>نمودار مصرف ترافیک</h3></div>
+                    <canvas id="bandwidthChart" height="80" role="img" aria-label="نمودار مصرف ترافیک"></canvas>
                 </div>
             </div>
 
@@ -2868,9 +2889,9 @@ function mgmtAdminHTML() {
     </div>
 
     <!-- Create User Modal -->
-    <div id="createModal" class="modal">
+    <div id="createModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="createModalTitle">
         <div class="modal-content">
-            <h2>➕ ایجاد کاربر جدید</h2>
+            <h2 id="createModalTitle">➕ ایجاد کاربر جدید</h2>
             <div class="form-group">
                 <label>نام کاربری</label>
                 <input type="text" id="newUsername" placeholder="نام کاربری">
@@ -3195,9 +3216,9 @@ function mgmtAdminHTML() {
         // ============================================
         function showSection(id, el) {
             document.querySelectorAll('.section').forEach(s => s.style.display = 'none');
-            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(n => { n.classList.remove('active'); n.setAttribute('aria-selected', 'false'); });
             document.getElementById(id).style.display = 'block';
-            if (el) el.classList.add('active');
+            if (el) { el.classList.add('active'); el.setAttribute('aria-selected', 'true'); }
 
             if (id === 'users-section') loadUsers();
             if (id === 'plans-section') loadPlans();
