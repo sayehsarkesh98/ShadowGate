@@ -2675,9 +2675,11 @@ function mgmtAdminHTML() {
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">منقضی</h3><div class="val danger" id="statExpired" style="font-size:1.2rem">0</div></div>
                     <div class="stat" style="padding:0.75rem;text-align:center"><h3 style="font-size:0.7rem">ترافیک امروز</h3><div class="val" id="statTodayBW" style="font-size:1.2rem">0 B</div></div>
                 </div>
-                <div class="chart-container" style="padding:1.25rem">
+                <div class="chart-container" style="padding:1.25rem;max-width:920px">
                     <div class="chart-header"><h3><svg class="icon"><use href="#i-dashboard"/></svg>نمودار مصرف ترافیک</h3></div>
-                    <canvas id="bandwidthChart" height="80" role="img" aria-label="نمودار مصرف ترافیک"></canvas>
+                    <div style="position:relative;height:280px">
+                        <canvas id="bandwidthChart" role="img" aria-label="نمودار مصرف ترافیک"></canvas>
+                    </div>
                 </div>
             </div>
 
@@ -2811,7 +2813,7 @@ function mgmtAdminHTML() {
                         <button class="btn btn-success btn-sm" onclick="testAllCleanIPs()" id="testAllBtn"><svg class="icon"><use href="#i-search"/></svg>تست همه</button>
                         <button class="btn btn-outline btn-sm" onclick="copyAllCleanIPs()" id="copyAllCleanBtn">📋 کپی همه</button>
                         <button class="btn btn-primary btn-sm" onclick="showBulkCleanIPModal()"><svg class="icon"><use href="#i-list"/></svg>افزودن گروهی</button>
-                        <button class="btn btn-primary btn-sm" onclick="showAddCleanIPModal()"><svg class="icon"><use href="#i-plus"/></svg>افزودن Clean IP</button>
+                        <button class="btn btn-primary btn-sm" onclick="showAddCleanIPModal()"><svg class="icon"><use href="#i-plus"/></svg>افزودن Clean IP ها</button>
                     </div>
                 </div>
                 <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:1rem">IP های تمیز اینجا تعریف شده و به صورت خودکار در کانفیگ‌های کاربران نمایش داده می‌شوند.</p>
@@ -2821,7 +2823,7 @@ function mgmtAdminHTML() {
             <!-- Add/Edit Clean IP Modal -->
             <div id="cleanIPModal" class="modal">
                 <div class="modal-content" style="max-width:450px">
-                    <h2 id="cleanIPModalTitle">افزودن Clean IP</h2>
+                    <h2 id="cleanIPModalTitle">افزودن Clean IP ها</h2>
                     <input type="hidden" id="cleanIPEditId">
                     <div class="form-group"><label>نام</label><input type="text" id="cleanIPName" placeholder="مثلاً: Cloudflare CDN"></div>
                     <div class="form-row">
@@ -3862,7 +3864,7 @@ function mgmtAdminHTML() {
         }
         function escH(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
         function showAddCleanIPModal() {
-            document.getElementById('cleanIPModalTitle').textContent = 'افزودن Clean IP';
+            document.getElementById('cleanIPModalTitle').textContent = 'افزودن Clean IP ها';
             document.getElementById('cleanIPEditId').value = '';
             document.getElementById('cleanIPName').value = '';
             document.getElementById('cleanIPIP').value = '';
@@ -3875,7 +3877,7 @@ function mgmtAdminHTML() {
         function editCleanIP(id) {
             var c = _cleanIPCache.find(function(x){ return x.id === id; });
             if (!c) return;
-            document.getElementById('cleanIPModalTitle').textContent = 'ویرایش Clean IP';
+            document.getElementById('cleanIPModalTitle').textContent = 'ویرایش Clean IP ها';
             document.getElementById('cleanIPEditId').value = c.id;
             document.getElementById('cleanIPName').value = c.name;
             document.getElementById('cleanIPIP').value = c.ip;
@@ -4118,6 +4120,11 @@ function mgmtAdminHTML() {
                             data,
                             borderColor: '#38bdf8',
                             backgroundColor: 'rgba(56,189,248,0.12)',
+                            borderWidth: 2.5,
+                            pointBackgroundColor: '#38bdf8',
+                            pointBorderColor: 'rgba(56,189,248,0.35)',
+                            pointRadius: 4,
+                            pointHoverRadius: 6,
                             fill: true,
                             tension: 0.4
                         }]
@@ -4128,8 +4135,8 @@ function mgmtAdminHTML() {
                         borderColor: 'rgba(56,189,248,0.4)',
                         plugins: { legend: { labels: { color: '#94a3b8', font: { family: "'Segoe UI', Tahoma" } } } },
                         scales: {
-                            x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.12)' } },
-                            y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.12)' } }
+                            x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(56,189,248,0.22)', lineWidth: 1.5 }, border: { color: 'rgba(56,189,248,0.35)' } },
+                            y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.10)' } }
                         }
                     }
                 });
